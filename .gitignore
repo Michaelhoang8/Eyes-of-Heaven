@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.tmp/
+*.py[cod]
+data/*.duckdb.wal
+data/*.duckdb.tmp
+data/*.duckdb
+data/dashboard_snapshot/
