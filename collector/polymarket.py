@@ -15,6 +15,12 @@ from .markets import bump_status, is_query_interrupted, utcnow
 URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
 
+async def application_heartbeat(websocket, interval: float = 10) -> None:
+    while True:
+        await asyncio.sleep(interval)
+        await websocket.send("PING")
+
+
 def _ts(value, receipt):
     if not value:
         return receipt
@@ -85,22 +91,31 @@ async def collect_polymarket(con: duckdb.DuckDBPyConnection, market: dict, stop:
     delay = base_delay
     while not stop.is_set():
         try:
-            async with connector(URL, ping_interval=20, ping_timeout=20) as ws:
+            # Polymarket requires text PING/PONG heartbeats. Disable the websockets
+            # control-frame heartbeat so only the protocol-required mechanism runs.
+            async with connector(URL, ping_interval=None) as ws:
                 await ws.send(json.dumps({"assets_ids": [market["up_token_id"], market["down_token_id"]],
                                           "type": "market", "custom_feature_enabled": True}))
                 delay = base_delay
-                async for raw in ws:
-                    if stop.is_set(): return
-                    try:
-                        quotes, trades = parse_polymarket(raw, market)
-                        added, dup = insert_events(con, quotes, trades)
-                        bump_status(con, "polymarket", events=added, duplicates=dup,
-                                    message_time=utcnow() if added else None)
-                    except Exception as exc:
-                        if stop.is_set() or is_query_interrupted(exc):
-                            return
-                        logging.exception("Malformed Polymarket message")
-                        bump_status(con, "polymarket", malformed=1, error=str(exc))
+                heartbeat_task = asyncio.create_task(application_heartbeat(ws))
+                try:
+                    async for raw in ws:
+                        if stop.is_set(): return
+                        if raw == "PONG":
+                            continue
+                        try:
+                            quotes, trades = parse_polymarket(raw, market)
+                            added, dup = insert_events(con, quotes, trades)
+                            bump_status(con, "polymarket", events=added, duplicates=dup,
+                                        message_time=utcnow() if added else None)
+                        except Exception as exc:
+                            if stop.is_set() or is_query_interrupted(exc):
+                                return
+                            logging.exception("Malformed Polymarket message")
+                            bump_status(con, "polymarket", malformed=1, error=str(exc))
+                finally:
+                    heartbeat_task.cancel()
+                    await asyncio.gather(heartbeat_task, return_exceptions=True)
         except asyncio.CancelledError: raise
         except Exception as exc:
             if stop.is_set() or is_query_interrupted(exc):
