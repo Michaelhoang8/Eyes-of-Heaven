@@ -340,3 +340,112 @@ def test_shutdown_cancels_and_awaits_multiple_polymarket_tasks(monkeypatch):
 
     asyncio.run(exercise())
     assert cancelled == {"five", "fifteen"}
+
+
+def test_unexpected_binance_exception_is_logged_and_fatal(caplog):
+    import asyncio
+    import logging
+    import pytest
+    from collector import main
+
+    async def exercise():
+        async def fail(): raise ValueError("binance died")
+        task = asyncio.create_task(fail())
+        await asyncio.sleep(0)
+        with pytest.raises(RuntimeError, match="Binance collector task stopped"):
+            main.supervise_binance_task(task)
+
+    with caplog.at_level(logging.ERROR):
+        asyncio.run(exercise())
+    assert "Binance collector task raised" in caplog.text
+    assert "binance died" in caplog.text
+
+
+def test_polymarket_exception_is_logged_before_restart(monkeypatch, caplog):
+    import asyncio
+    import logging
+    from collector import main
+
+    market = {"market_id": "broken-market", "question": "broken"}
+    async def fail(): raise ValueError("polymarket died")
+    async def idle(): await asyncio.Event().wait()
+    monkeypatch.setattr(main, "collect_polymarket", lambda *_args: idle())
+
+    async def exercise():
+        failed = asyncio.create_task(fail())
+        await asyncio.sleep(0)
+        tasks = {"broken-market": failed}
+        await main.reconcile_polymarket_tasks(None, asyncio.Event(), tasks, [market])
+        assert tasks["broken-market"] is not failed
+        await main.cancel_polymarket_tasks(tasks)
+
+    with caplog.at_level(logging.INFO):
+        asyncio.run(exercise())
+    assert "Polymarket task raised market_id=broken-market" in caplog.text
+    assert "polymarket died" in caplog.text
+
+
+def test_cancelled_polymarket_task_is_not_reported_as_failure(monkeypatch, caplog):
+    import asyncio
+    import logging
+    from collector import main
+
+    market = {"market_id": "cancelled-market", "question": "cancelled"}
+    async def idle(): await asyncio.Event().wait()
+    monkeypatch.setattr(main, "collect_polymarket", lambda *_args: idle())
+
+    async def exercise():
+        cancelled = asyncio.create_task(idle())
+        await asyncio.sleep(0)
+        cancelled.cancel()
+        await asyncio.gather(cancelled, return_exceptions=True)
+        tasks = {"cancelled-market": cancelled}
+        await main.reconcile_polymarket_tasks(None, asyncio.Event(), tasks, [market])
+        await main.cancel_polymarket_tasks(tasks)
+
+    with caplog.at_level(logging.INFO):
+        asyncio.run(exercise())
+    assert "Polymarket task cancelled market_id=cancelled-market" in caplog.text
+    assert not [record for record in caplog.records
+                if record.levelno >= logging.ERROR and "cancelled-market" in record.message]
+
+
+def test_graceful_shutdown_logs_full_lifecycle(monkeypatch, caplog):
+    import asyncio
+    import logging
+    from collector import main
+
+    class Connection:
+        def close(self): pass
+
+    async def idle(): await asyncio.Event().wait()
+    async def discover(): return []
+    async def stop_run(awaitable, timeout):
+        awaitable.close()
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(main, "connect_db", Connection)
+    monkeypatch.setattr(main, "repair_interval_starts", lambda _con: 0)
+    monkeypatch.setattr(main, "collect_binance", lambda *_args: idle())
+    monkeypatch.setattr(main, "discover_markets", discover)
+    monkeypatch.setattr(main.asyncio, "wait_for", stop_run)
+
+    with caplog.at_level(logging.INFO):
+        try: asyncio.run(main.run())
+        except KeyboardInterrupt: pass
+
+    for message in ("Collector run start UTC", "Collector stop event set",
+                    "Collector shutdown beginning", "Collector shutdown complete",
+                    "Collector run exit UTC"):
+        assert message in caplog.text
+
+
+def test_event_loop_lag_warns_only_above_threshold(caplog):
+    import logging
+    from collector import main
+
+    with caplog.at_level(logging.WARNING):
+        main.warn_event_loop_lag(expected=10, actual=10.9, threshold=1)
+        assert "Event loop wake lag" not in caplog.text
+        main.warn_event_loop_lag(expected=10, actual=11.1, threshold=1)
+    assert "Event loop wake lag 1.100s" in caplog.text

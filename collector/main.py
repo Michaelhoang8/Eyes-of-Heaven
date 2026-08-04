@@ -10,17 +10,59 @@ from .markets import connect_db, discover_markets, is_query_interrupted, publish
 from .polymarket import collect_polymarket
 
 
+def log_task_outcome(task: asyncio.Task, label: str, *, market_id: str | None = None) -> BaseException | None:
+    if getattr(task, "_collector_outcome_logged", False):
+        return None
+    task._collector_outcome_logged = True
+    identity = f" market_id={market_id}" if market_id else ""
+    if task.cancelled():
+        logging.info("%s task cancelled%s", label, identity)
+        return None
+    exception = task.exception()
+    if exception is not None:
+        logging.error("%s task raised%s", label, identity,
+                      exc_info=(type(exception), exception, exception.__traceback__))
+        return exception
+    logging.warning("%s task returned normally%s", label, identity)
+    return None
+
+
+def supervise_binance_task(task: asyncio.Task) -> None:
+    if not task.done():
+        return
+    exception = log_task_outcome(task, "Binance collector")
+    failure = RuntimeError("Binance collector task stopped unexpectedly")
+    if exception is not None:
+        raise failure from exception
+    raise failure
+
+
+def transition_stop(stop: asyncio.Event, reason: str) -> None:
+    if not stop.is_set():
+        logging.info("Collector stop event set reason=%s UTC=%s", reason, utcnow().isoformat())
+        stop.set()
+
+
+def warn_event_loop_lag(expected: float, actual: float, threshold: float = 1) -> None:
+    lag = actual - expected
+    if lag > threshold:
+        logging.warning("Event loop wake lag %.3fs exceeded %.3fs threshold", lag, threshold)
+
+
 async def reconcile_polymarket_tasks(con, stop: asyncio.Event, tasks: dict[str, asyncio.Task],
                                      eligible: list[dict]) -> bool:
     """Make the running Polymarket tasks match the currently eligible markets."""
     markets = {market["market_id"]: market for market in eligible}
     stale_ids = [market_id for market_id, task in tasks.items()
                  if market_id not in markets or task.done()]
-    stale_tasks = [tasks.pop(market_id) for market_id in stale_ids]
-    for task in stale_tasks:
-        task.cancel()
+    stale_tasks = [(market_id, tasks.pop(market_id)) for market_id in stale_ids]
+    for _, task in stale_tasks:
+        if not task.done():
+            task.cancel()
     if stale_tasks:
-        await asyncio.gather(*stale_tasks, return_exceptions=True)
+        await asyncio.gather(*(task for _, task in stale_tasks), return_exceptions=True)
+        for market_id, task in stale_tasks:
+            log_task_outcome(task, "Polymarket", market_id=market_id)
 
     started = False
     for market_id, market in markets.items():
@@ -32,11 +74,13 @@ async def reconcile_polymarket_tasks(con, stop: asyncio.Event, tasks: dict[str, 
 
 
 async def cancel_polymarket_tasks(tasks: dict[str, asyncio.Task]) -> None:
-    active = list(tasks.values())
-    for task in active:
+    active = list(tasks.items())
+    for _, task in active:
         task.cancel()
     if active:
-        await asyncio.gather(*active, return_exceptions=True)
+        await asyncio.gather(*(task for _, task in active), return_exceptions=True)
+        for market_id, task in active:
+            log_task_outcome(task, "Polymarket", market_id=market_id)
     tasks.clear()
 
 
@@ -64,13 +108,14 @@ def next_market_boundary(markets: list[dict], now: datetime) -> datetime | None:
 
 async def run() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.info("Collector run start UTC=%s", utcnow().isoformat())
     con = connect_db(); stop = asyncio.Event()
     repaired = repair_interval_starts(con)
     if repaired:
         logging.warning("Repaired incorrect interval start timestamps for %d existing markets", repaired)
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
-        try: loop.add_signal_handler(sig, stop.set)
+        try: loop.add_signal_handler(sig, transition_stop, stop, f"signal {sig.name}")
         except NotImplementedError: pass
     bitcoin_task = asyncio.create_task(collect_binance(con, stop))
     poly_tasks: dict[str, asyncio.Task] = {}
@@ -78,6 +123,7 @@ async def run() -> None:
     next_discovery: datetime | None = None
     try:
         while not stop.is_set():
+            supervise_binance_task(bitcoin_task)
             changed = False
             try:
                 now = utcnow()
@@ -112,14 +158,29 @@ async def run() -> None:
             wakeups = [value for value in (next_discovery, next_market_boundary(known_markets, now))
                        if value is not None]
             refresh_seconds = max(.01, (min(wakeups)-now).total_seconds()) if wakeups else 30.0
-            try: await asyncio.wait_for(stop.wait(), timeout=refresh_seconds)
-            except (TimeoutError, asyncio.TimeoutError): pass
+            expected_wake = loop.time() + refresh_seconds
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=refresh_seconds)
+            except (TimeoutError, asyncio.TimeoutError):
+                pass
+            finally:
+                if not stop.is_set():
+                    warn_event_loop_lag(expected_wake, loop.time())
     finally:
-        stop.set()
-        bitcoin_task.cancel()
-        await cancel_polymarket_tasks(poly_tasks)
-        await asyncio.gather(bitcoin_task, return_exceptions=True)
-        con.close()
+        logging.info("Collector shutdown beginning UTC=%s", utcnow().isoformat())
+        transition_stop(stop, "shutdown")
+        try:
+            if not bitcoin_task.done():
+                bitcoin_task.cancel()
+            await cancel_polymarket_tasks(poly_tasks)
+            await asyncio.gather(bitcoin_task, return_exceptions=True)
+            log_task_outcome(bitcoin_task, "Binance collector")
+        finally:
+            try:
+                con.close()
+            finally:
+                logging.info("Collector shutdown complete UTC=%s", utcnow().isoformat())
+                logging.info("Collector run exit UTC=%s", utcnow().isoformat())
 
 
 if __name__ == "__main__":
