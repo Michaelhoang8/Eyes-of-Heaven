@@ -10,7 +10,7 @@ from typing import Awaitable, Callable
 import duckdb
 import websockets
 
-from .markets import bump_status, utcnow
+from .markets import bump_status, is_query_interrupted, utcnow
 
 URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
@@ -97,10 +97,14 @@ async def collect_polymarket(con: duckdb.DuckDBPyConnection, market: dict, stop:
                         bump_status(con, "polymarket", events=added, duplicates=dup,
                                     message_time=utcnow() if added else None)
                     except Exception as exc:
+                        if stop.is_set() or is_query_interrupted(exc):
+                            return
                         logging.exception("Malformed Polymarket message")
                         bump_status(con, "polymarket", malformed=1, error=str(exc))
         except asyncio.CancelledError: raise
         except Exception as exc:
+            if stop.is_set() or is_query_interrupted(exc):
+                return
             logging.warning("Polymarket websocket disconnected; reconnecting in %.1fs: %s", delay, exc)
             bump_status(con, "polymarket", reconnects=1, error=str(exc))
             try: await asyncio.wait_for(stop.wait(), timeout=delay)

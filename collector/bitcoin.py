@@ -9,7 +9,7 @@ from typing import Awaitable, Callable
 import duckdb
 import websockets
 
-from .markets import bump_status, utcnow
+from .markets import bump_status, is_query_interrupted, utcnow
 
 URL = "wss://stream.binance.com:9443/stream?streams=btcusdt@aggTrade/btcusdt@bookTicker"
 
@@ -59,10 +59,14 @@ async def collect_binance(con: duckdb.DuckDBPyConnection, stop: asyncio.Event, *
                         fresh = insert_event(con, event)
                         bump_status(con, "binance", events=int(fresh), duplicates=int(not fresh), message_time=event["exchange_timestamp"])
                     except Exception as exc:
+                        if stop.is_set() or is_query_interrupted(exc):
+                            return
                         logging.exception("Malformed Binance message")
                         bump_status(con, "binance", malformed=1, error=str(exc))
         except asyncio.CancelledError: raise
         except Exception as exc:
+            if stop.is_set() or is_query_interrupted(exc):
+                return
             logging.warning("Binance websocket disconnected; reconnecting in %.1fs: %s", delay, exc)
             bump_status(con, "binance", reconnects=1, error=str(exc))
             try: await asyncio.wait_for(stop.wait(), timeout=delay)

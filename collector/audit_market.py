@@ -12,6 +12,18 @@ import pandas as pd
 from dashboard.queries import completed_market_summary, market_series, open_connection
 
 GAMMA_EVENT_URL = "https://gamma-api.polymarket.com/events/slug/{slug}"
+Finding = tuple[str, str, str, str, str, str]
+
+
+def determine_verdict(*, failures: list[Finding], suspicious: list[Finding],
+                      official_available: bool, polymarket_event_count: int,
+                      token_sanity: str) -> str:
+    if failures:
+        return "FAIL"
+    if (suspicious or not official_available or polymarket_event_count == 0
+            or token_sanity != "PASS"):
+        return "SUSPICIOUS"
+    return "PASS"
 
 
 def utc(value: Any) -> datetime | None:
@@ -81,8 +93,8 @@ def audit(market_id: str | None, latest: bool, max_age: float, database: str | N
     start, end = utc(market["start_time"]), utc(market["end_time"])
     duration = (end-start).total_seconds() if start and end else None
     intended = expected_minutes(market)
-    failures: list[tuple[str,str,str,str,str]] = []
-    suspicious: list[tuple[str,str,str,str,str]] = []
+    failures: list[Finding] = []
+    suspicious: list[Finding] = []
 
     print("MARKET METADATA")
     for label,key in (("market_id","market_id"),("event_id","event_id"),("slug","slug"),("question/title","question")):
@@ -123,6 +135,12 @@ def audit(market_id: str | None, latest: bool, max_age: float, database: str | N
     for label,value in zip(("total quote count","first event timestamp","last event timestamp","first receipt timestamp","last receipt timestamp","Up quote count","Down quote count","quotes before start","quotes after end"),qstats): print(f"{label}: {fmt(value)}")
     print(f"total trade count: {tstats[0]}")
     print(f"trades before start: {tstats[1]}"); print(f"trades after end: {tstats[2]}")
+    in_window_polymarket_events = (qstats[0]-qstats[7]-qstats[8]) + (tstats[0]-tstats[1]-tstats[2])
+    if in_window_polymarket_events == 0:
+        suspicious.append(("MEDIUM","Polymarket data completeness",
+          "no Polymarket quotes or trades were recorded during the market interval",
+          "cause unavailable from the recorded data","collector/audit_market.py audit",
+          "Collect more data before treating this market as fully validated"))
     outside = qstats[7]+qstats[8]+tstats[1]+tstats[2]
     if outside:
         print("Outside-window samples:")
@@ -195,6 +213,16 @@ def audit(market_id: str | None, latest: bool, max_age: float, database: str | N
     if last_prices.get(winner) is not None and last_prices.get(loser) is not None:
         token_sanity="PASS" if last_prices[winner]>=.9 and last_prices[loser]<=.1 else "SUSPICIOUS"
     print(f"Token mapping sanity check: {token_sanity}")
+    if token_sanity == "INSUFFICIENT DATA" and in_window_polymarket_events > 0:
+        suspicious.append(("MEDIUM","Polymarket data completeness",
+          "recorded data is insufficient to validate both Up and Down token price behavior",
+          "cause unavailable from the recorded data","collector/audit_market.py audit",
+          "Collect sufficient two-sided quotes before treating token mapping as fully validated"))
+    elif token_sanity == "SUSPICIOUS":
+        suspicious.append(("MEDIUM","token mapping sanity",
+          "winning and losing token prices did not approach expected settlement values",
+          "cause unavailable from the recorded data","collector/audit_market.py audit",
+          "Inspect the recorded token quotes and official outcome mapping"))
 
     checkpoint_results={}
     print(f"\nCHECKPOINT AUDIT (MAX_CHECKPOINT_AGE_SECONDS={max_age:g})")
@@ -249,13 +277,15 @@ def audit(market_id: str | None, latest: bool, max_age: float, database: str | N
 
     if change is not None and market.get("resolved_outcome") in ("Up","Down") and ((change<0 and market['resolved_outcome']=='Up') or (change>0 and market['resolved_outcome']=='Down')):
         suspicious.append(("MEDIUM","resolution comparison",f"Binance change {change:.4f} disagrees with official winner {market['resolved_outcome']}","Polymarket settles on Chainlink, not Binance","collector/audit_market.py","Do not infer settlement from Binance"))
-    status="FAIL" if failures else ("SUSPICIOUS" if suspicious or not official else "PASS")
+    status=determine_verdict(failures=failures, suspicious=suspicious,
+      official_available=official is not None, polymarket_event_count=in_window_polymarket_events,
+      token_sanity=token_sanity)
     print(f"\nOVERALL STATUS: {status}")
     print("\nFINDINGS")
     findings=failures+suspicious
     if not findings: print("No issues found.")
     for severity,component,evidence,cause,source,fix in findings:
-        print(f"severity: {severity}\naffected component: {component}\nevidence: {evidence}\nlikely cause: {cause}\nexact source file/function: {source}\nrecommended fix: {fix}\n")
+        print(f"severity: {severity}\narea: {component}\nevidence: {evidence}\nlikely cause: {cause}\nexact source file/function: {source}\nrecommended fix: {fix}\n")
     return 1 if status=="FAIL" else 0
 
 

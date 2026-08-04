@@ -57,6 +57,11 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def is_query_interrupted(exc: BaseException) -> bool:
+    """DuckDB raises RuntimeError when Ctrl+C interrupts an active query."""
+    return "query interrupted" in str(exc).lower()
+
+
 def parse_utc(value: Any) -> datetime | None:
     if value in (None, ""):
         return None
