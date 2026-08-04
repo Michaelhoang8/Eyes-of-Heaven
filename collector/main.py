@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from .bitcoin import collect_binance
 from .markets import connect_db, discover_markets, is_query_interrupted, publish_dashboard_snapshot, repair_interval_starts, upsert_market, utcnow
@@ -40,6 +40,28 @@ async def cancel_polymarket_tasks(tasks: dict[str, asyncio.Task]) -> None:
     tasks.clear()
 
 
+def parsed_time(value):
+    if not value: return None
+    if isinstance(value, datetime): return value
+    return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+
+
+def eligible_markets(markets: list[dict], now: datetime) -> list[dict]:
+    return [market for market in markets
+            if (not parsed_time(market["start_time"]) or parsed_time(market["start_time"]) <= now)
+            and (not parsed_time(market["end_time"]) or now < parsed_time(market["end_time"]))]
+
+
+def next_market_boundary(markets: list[dict], now: datetime) -> datetime | None:
+    boundaries = []
+    for market in markets:
+        start = parsed_time(market.get("start_time"))
+        end = parsed_time(market.get("end_time"))
+        if start and now < start: boundaries.append(start)
+        if end and now < end: boundaries.append(end)
+    return min(boundaries, default=None)
+
+
 async def run() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     con = connect_db(); stop = asyncio.Event()
@@ -52,29 +74,44 @@ async def run() -> None:
         except NotImplementedError: pass
     bitcoin_task = asyncio.create_task(collect_binance(con, stop))
     poly_tasks: dict[str, asyncio.Task] = {}
+    known_markets: list[dict] = []
+    next_discovery: datetime | None = None
     try:
         while not stop.is_set():
-            eligible = []
+            changed = False
             try:
-                found = await discover_markets()
-                for market in found: upsert_market(con, market)
                 now = utcnow()
-                def parsed(value):
-                    if not value: return None
-                    if isinstance(value, datetime): return value
-                    return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-                eligible = [m for m in found if (not parsed(m["start_time"]) or parsed(m["start_time"]) <= now)
-                            and (not parsed(m["end_time"]) or now < parsed(m["end_time"]))]
-                if await reconcile_polymarket_tasks(con, stop, poly_tasks, eligible):
+                changed = await reconcile_polymarket_tasks(
+                    con, stop, poly_tasks, eligible_markets(known_markets, now))
+
+                if next_discovery is None or now >= next_discovery:
+                    next_discovery = now + timedelta(seconds=30)
+                    boundary = next_market_boundary(known_markets, now)
+                    boundary_seconds = ((boundary-now).total_seconds() if boundary else None)
+                    try:
+                        if boundary_seconds is not None:
+                            found = await asyncio.wait_for(discover_markets(), timeout=max(.01, boundary_seconds))
+                        else:
+                            found = await discover_markets()
+                    except (TimeoutError, asyncio.TimeoutError):
+                        continue
+                    for market in found: upsert_market(con, market)
+                    known_markets = found
+                    now = utcnow()
+                    next_discovery = now + timedelta(seconds=30)
+                    changed = await reconcile_polymarket_tasks(
+                        con, stop, poly_tasks, eligible_markets(known_markets, now)) or changed
+
+                if changed:
                     publish_dashboard_snapshot(con)
             except Exception as exc:
                 if stop.is_set() or is_query_interrupted(exc):
                     break
                 logging.exception("Market discovery failed")
-            refresh_seconds = 30.0
-            ends = [parsed(m.get("end_time")) for m in eligible if parsed(m.get("end_time"))]
-            if ends:
-                refresh_seconds = max(.1, min(30.0, (min(ends)-utcnow()).total_seconds()+.05))
+            now = utcnow()
+            wakeups = [value for value in (next_discovery, next_market_boundary(known_markets, now))
+                       if value is not None]
+            refresh_seconds = max(.01, (min(wakeups)-now).total_seconds()) if wakeups else 30.0
             try: await asyncio.wait_for(stop.wait(), timeout=refresh_seconds)
             except (TimeoutError, asyncio.TimeoutError): pass
     finally:

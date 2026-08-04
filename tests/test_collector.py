@@ -136,6 +136,97 @@ def test_overlapping_5m_and_15m_markets_are_both_collected(monkeypatch):
     assert set(started) == {"five", "fifteen"}
 
 
+def test_future_market_wakes_at_start_boundary_not_next_poll(monkeypatch):
+    import asyncio
+    from collector import main
+
+    now = datetime(2026, 8, 4, 4, 59, 50, tzinfo=timezone.utc)
+    market = {"market_id": "future", "question": "future", "start_time":
+              datetime(2026, 8, 4, 5, 0, tzinfo=timezone.utc), "end_time":
+              datetime(2026, 8, 4, 5, 5, tzinfo=timezone.utc)}
+    waits = []
+
+    class Connection:
+        def close(self): pass
+
+    async def idle(): await asyncio.Event().wait()
+    async def discover(): return [market]
+    async def capture_wait(awaitable, timeout):
+        awaitable.close()
+        waits.append(timeout)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(main, "connect_db", Connection)
+    monkeypatch.setattr(main, "repair_interval_starts", lambda _con: 0)
+    monkeypatch.setattr(main, "collect_binance", lambda *_args: idle())
+    monkeypatch.setattr(main, "discover_markets", discover)
+    monkeypatch.setattr(main, "upsert_market", lambda *_args: None)
+    monkeypatch.setattr(main, "utcnow", lambda: now)
+    monkeypatch.setattr(main.asyncio, "wait_for", capture_wait)
+
+    try:
+        asyncio.run(main.run())
+    except KeyboardInterrupt:
+        pass
+
+    assert waits[0] <= 10.1
+
+
+def test_expired_collector_is_cancelled_before_next_discovery(monkeypatch):
+    import asyncio
+    from collector import main
+
+    clock = [datetime(2026, 8, 4, 4, 59, 50, tzinfo=timezone.utc)]
+    end = datetime(2026, 8, 4, 5, 0, tzinfo=timezone.utc)
+    market = {"market_id": "ending", "question": "ending", "start_time": clock[0],
+              "end_time": end}
+    cancelled = set()
+    observed_at_second_wakeup = []
+    discoveries = 0
+    waits = 0
+
+    class Connection:
+        def close(self): pass
+
+    async def idle(): await asyncio.Event().wait()
+    async def collect(_con, selected, _stop):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.add(selected["market_id"])
+    async def discover():
+        nonlocal discoveries
+        discoveries += 1
+        return [market]
+    async def advance_to_end(awaitable, timeout):
+        nonlocal waits
+        waits += 1
+        await asyncio.sleep(0)
+        awaitable.close()
+        if waits == 2:
+            observed_at_second_wakeup.append(("ending" in cancelled, discoveries))
+            raise KeyboardInterrupt
+        clock[0] = end
+        raise TimeoutError
+
+    monkeypatch.setattr(main, "connect_db", Connection)
+    monkeypatch.setattr(main, "repair_interval_starts", lambda _con: 0)
+    monkeypatch.setattr(main, "collect_binance", lambda *_args: idle())
+    monkeypatch.setattr(main, "collect_polymarket", collect)
+    monkeypatch.setattr(main, "discover_markets", discover)
+    monkeypatch.setattr(main, "upsert_market", lambda *_args: None)
+    monkeypatch.setattr(main, "publish_dashboard_snapshot", lambda _con: None)
+    monkeypatch.setattr(main, "utcnow", lambda: clock[0])
+    monkeypatch.setattr(main.asyncio, "wait_for", advance_to_end)
+
+    try:
+        asyncio.run(main.run())
+    except KeyboardInterrupt:
+        pass
+
+    assert observed_at_second_wakeup == [(True, 1)]
+
+
 def test_sequential_discovery_does_not_duplicate_market_tasks(monkeypatch):
     import asyncio
     from collector import main
@@ -162,6 +253,43 @@ def test_sequential_discovery_does_not_duplicate_market_tasks(monkeypatch):
         await main.cancel_polymarket_tasks(tasks)
 
     asyncio.run(exercise())
+
+
+def test_market_discovered_minutes_early_starts_once_at_boundary(monkeypatch):
+    import asyncio
+    from collector import main
+
+    clock = [datetime(2026, 8, 4, 4, 57, tzinfo=timezone.utc)]
+    start = datetime(2026, 8, 4, 5, 0, tzinfo=timezone.utc)
+    market = {"market_id": "future", "question": "future", "start_time": start,
+              "end_time": datetime(2026, 8, 4, 5, 5, tzinfo=timezone.utc)}
+    started = []
+
+    async def idle(): await asyncio.Event().wait()
+    def collect(_con, selected, _stop):
+        started.append((selected["market_id"], clock[0]))
+        return idle()
+
+    monkeypatch.setattr(main, "collect_polymarket", collect)
+
+    async def exercise():
+        tasks = {}
+        stop = asyncio.Event()
+        for minute in (57, 58, 59):
+            clock[0] = datetime(2026, 8, 4, 4, minute, tzinfo=timezone.utc)
+            await main.reconcile_polymarket_tasks(
+                None, stop, tasks, main.eligible_markets([market], clock[0]))
+            assert tasks == {}
+        clock[0] = start
+        eligible = main.eligible_markets([market], clock[0])
+        await main.reconcile_polymarket_tasks(None, stop, tasks, eligible)
+        original = tasks["future"]
+        await main.reconcile_polymarket_tasks(None, stop, tasks, eligible)
+        assert tasks["future"] is original
+        await main.cancel_polymarket_tasks(tasks)
+
+    asyncio.run(exercise())
+    assert started == [("future", start)]
 
 
 def test_expired_market_task_is_cancelled_and_removed(monkeypatch):
