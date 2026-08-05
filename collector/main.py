@@ -49,6 +49,57 @@ def warn_event_loop_lag(expected: float, actual: float, threshold: float = 1) ->
         logging.warning("Event loop wake lag %.3fs exceeded %.3fs threshold", lag, threshold)
 
 
+def start_discovery_if_due(task: asyncio.Task | None, next_discovery: datetime | None,
+                           now: datetime) -> asyncio.Task | None:
+    if task is None and (next_discovery is None or now >= next_discovery):
+        return asyncio.create_task(discover_markets())
+    return task
+
+
+def apply_discovery_result(con, task: asyncio.Task, known_markets: list[dict]) -> tuple[list[dict], bool]:
+    task._collector_outcome_logged = True
+    try:
+        found = task.result()
+    except asyncio.CancelledError:
+        logging.info("Gamma discovery task cancelled")
+        return known_markets, False
+    except Exception as exc:
+        logging.error("Market discovery failed", exc_info=(type(exc), exc, exc.__traceback__))
+        return known_markets, False
+    for market in found:
+        upsert_market(con, market)
+    return found, True
+
+
+async def cancel_discovery_task(task: asyncio.Task | None) -> None:
+    if task is None:
+        return
+    if not task.done():
+        task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    if not getattr(task, "_collector_outcome_logged", False):
+        log_task_outcome(task, "Gamma discovery")
+
+
+async def wait_for_lifecycle_wakeup(stop: asyncio.Event, bitcoin_task: asyncio.Task,
+                                    discovery_task: asyncio.Task | None,
+                                    timeout: float | None) -> None:
+    loop = asyncio.get_running_loop()
+    expected_wake = loop.time() + timeout if timeout is not None else None
+    stop_task = asyncio.create_task(stop.wait())
+    waiters = {stop_task, bitcoin_task}
+    if discovery_task is not None:
+        waiters.add(discovery_task)
+    try:
+        await asyncio.wait(waiters, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        if not stop_task.done():
+            stop_task.cancel()
+        await asyncio.gather(stop_task, return_exceptions=True)
+        if expected_wake is not None and not stop.is_set():
+            warn_event_loop_lag(expected_wake, loop.time())
+
+
 async def reconcile_polymarket_tasks(con, stop: asyncio.Event, tasks: dict[str, asyncio.Task],
                                      eligible: list[dict]) -> bool:
     """Make the running Polymarket tasks match the currently eligible markets."""
@@ -121,6 +172,7 @@ async def run() -> None:
     poly_tasks: dict[str, asyncio.Task] = {}
     known_markets: list[dict] = []
     next_discovery: datetime | None = None
+    discovery_task: asyncio.Task | None = None
     try:
         while not stop.is_set():
             supervise_binance_task(bitcoin_task)
@@ -130,23 +182,16 @@ async def run() -> None:
                 changed = await reconcile_polymarket_tasks(
                     con, stop, poly_tasks, eligible_markets(known_markets, now))
 
-                if next_discovery is None or now >= next_discovery:
-                    next_discovery = now + timedelta(seconds=30)
-                    boundary = next_market_boundary(known_markets, now)
-                    boundary_seconds = ((boundary-now).total_seconds() if boundary else None)
-                    try:
-                        if boundary_seconds is not None:
-                            found = await asyncio.wait_for(discover_markets(), timeout=max(.01, boundary_seconds))
-                        else:
-                            found = await discover_markets()
-                    except (TimeoutError, asyncio.TimeoutError):
-                        continue
-                    for market in found: upsert_market(con, market)
-                    known_markets = found
+                if discovery_task is not None and discovery_task.done():
+                    known_markets, updated = apply_discovery_result(con, discovery_task, known_markets)
+                    discovery_task = None
                     now = utcnow()
                     next_discovery = now + timedelta(seconds=30)
-                    changed = await reconcile_polymarket_tasks(
-                        con, stop, poly_tasks, eligible_markets(known_markets, now)) or changed
+                    if updated:
+                        changed = await reconcile_polymarket_tasks(
+                            con, stop, poly_tasks, eligible_markets(known_markets, now)) or changed
+
+                discovery_task = start_discovery_if_due(discovery_task, next_discovery, utcnow())
 
                 if changed:
                     publish_dashboard_snapshot(con)
@@ -155,23 +200,20 @@ async def run() -> None:
                     break
                 logging.exception("Market discovery failed")
             now = utcnow()
-            wakeups = [value for value in (next_discovery, next_market_boundary(known_markets, now))
-                       if value is not None]
-            refresh_seconds = max(.01, (min(wakeups)-now).total_seconds()) if wakeups else 30.0
-            expected_wake = loop.time() + refresh_seconds
-            try:
-                await asyncio.wait_for(stop.wait(), timeout=refresh_seconds)
-            except (TimeoutError, asyncio.TimeoutError):
-                pass
-            finally:
-                if not stop.is_set():
-                    warn_event_loop_lag(expected_wake, loop.time())
+            boundary = next_market_boundary(known_markets, now)
+            wakeups = [boundary]
+            if discovery_task is None:
+                wakeups.append(next_discovery)
+            wakeups = [value for value in wakeups if value is not None]
+            refresh_seconds = max(.01, (min(wakeups)-now).total_seconds()) if wakeups else None
+            await wait_for_lifecycle_wakeup(stop, bitcoin_task, discovery_task, refresh_seconds)
     finally:
         logging.info("Collector shutdown beginning UTC=%s", utcnow().isoformat())
         transition_stop(stop, "shutdown")
         try:
             if not bitcoin_task.done():
                 bitcoin_task.cancel()
+            await cancel_discovery_task(discovery_task)
             await cancel_polymarket_tasks(poly_tasks)
             await asyncio.gather(bitcoin_task, return_exceptions=True)
             log_task_outcome(bitcoin_task, "Binance collector")

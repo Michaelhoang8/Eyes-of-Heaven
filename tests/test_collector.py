@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from collector.bitcoin import insert_event, ms_time, parse_binance
 from collector.markets import connect_db, is_query_interrupted, map_outcome_tokens, normalize_market, repair_interval_starts, upsert_market
@@ -114,9 +114,12 @@ def test_overlapping_5m_and_15m_markets_are_both_collected(monkeypatch):
     def collect(_con, market, _stop):
         started.append(market["market_id"])
         return idle()
-    async def stop_after_first_cycle(awaitable, timeout):
-        awaitable.close()
-        raise KeyboardInterrupt
+    wakeups = 0
+    async def stop_after_first_cycle(_stop, _bitcoin, _discovery, _timeout):
+        nonlocal wakeups
+        wakeups += 1
+        await asyncio.sleep(0)
+        if wakeups == 2: raise KeyboardInterrupt
 
     monkeypatch.setattr(main, "connect_db", Connection)
     monkeypatch.setattr(main, "repair_interval_starts", lambda _con: 0)
@@ -126,7 +129,7 @@ def test_overlapping_5m_and_15m_markets_are_both_collected(monkeypatch):
     monkeypatch.setattr(main, "upsert_market", lambda *_args: None)
     monkeypatch.setattr(main, "publish_dashboard_snapshot", lambda _con: None)
     monkeypatch.setattr(main, "utcnow", lambda: now)
-    monkeypatch.setattr(main.asyncio, "wait_for", stop_after_first_cycle)
+    monkeypatch.setattr(main, "wait_for_lifecycle_wakeup", stop_after_first_cycle)
 
     try:
         asyncio.run(main.run())
@@ -151,10 +154,14 @@ def test_future_market_wakes_at_start_boundary_not_next_poll(monkeypatch):
 
     async def idle(): await asyncio.Event().wait()
     async def discover(): return [market]
-    async def capture_wait(awaitable, timeout):
-        awaitable.close()
-        waits.append(timeout)
-        raise KeyboardInterrupt
+    wakeups = 0
+    async def capture_wait(_stop, _bitcoin, _discovery, timeout):
+        nonlocal wakeups
+        wakeups += 1
+        await asyncio.sleep(0)
+        if wakeups == 2:
+            waits.append(timeout)
+            raise KeyboardInterrupt
 
     monkeypatch.setattr(main, "connect_db", Connection)
     monkeypatch.setattr(main, "repair_interval_starts", lambda _con: 0)
@@ -162,7 +169,7 @@ def test_future_market_wakes_at_start_boundary_not_next_poll(monkeypatch):
     monkeypatch.setattr(main, "discover_markets", discover)
     monkeypatch.setattr(main, "upsert_market", lambda *_args: None)
     monkeypatch.setattr(main, "utcnow", lambda: now)
-    monkeypatch.setattr(main.asyncio, "wait_for", capture_wait)
+    monkeypatch.setattr(main, "wait_for_lifecycle_wakeup", capture_wait)
 
     try:
         asyncio.run(main.run())
@@ -198,16 +205,15 @@ def test_expired_collector_is_cancelled_before_next_discovery(monkeypatch):
         nonlocal discoveries
         discoveries += 1
         return [market]
-    async def advance_to_end(awaitable, timeout):
+    async def advance_to_end(_stop, _bitcoin, _discovery, _timeout):
         nonlocal waits
         waits += 1
         await asyncio.sleep(0)
-        awaitable.close()
-        if waits == 2:
+        if waits == 3:
             observed_at_second_wakeup.append(("ending" in cancelled, discoveries))
             raise KeyboardInterrupt
-        clock[0] = end
-        raise TimeoutError
+        if waits == 2:
+            clock[0] = end
 
     monkeypatch.setattr(main, "connect_db", Connection)
     monkeypatch.setattr(main, "repair_interval_starts", lambda _con: 0)
@@ -217,7 +223,7 @@ def test_expired_collector_is_cancelled_before_next_discovery(monkeypatch):
     monkeypatch.setattr(main, "upsert_market", lambda *_args: None)
     monkeypatch.setattr(main, "publish_dashboard_snapshot", lambda _con: None)
     monkeypatch.setattr(main, "utcnow", lambda: clock[0])
-    monkeypatch.setattr(main.asyncio, "wait_for", advance_to_end)
+    monkeypatch.setattr(main, "wait_for_lifecycle_wakeup", advance_to_end)
 
     try:
         asyncio.run(main.run())
@@ -420,15 +426,15 @@ def test_graceful_shutdown_logs_full_lifecycle(monkeypatch, caplog):
 
     async def idle(): await asyncio.Event().wait()
     async def discover(): return []
-    async def stop_run(awaitable, timeout):
-        awaitable.close()
+    async def stop_run(_stop, _bitcoin, _discovery, _timeout):
+        await asyncio.sleep(0)
         raise KeyboardInterrupt
 
     monkeypatch.setattr(main, "connect_db", Connection)
     monkeypatch.setattr(main, "repair_interval_starts", lambda _con: 0)
     monkeypatch.setattr(main, "collect_binance", lambda *_args: idle())
     monkeypatch.setattr(main, "discover_markets", discover)
-    monkeypatch.setattr(main.asyncio, "wait_for", stop_run)
+    monkeypatch.setattr(main, "wait_for_lifecycle_wakeup", stop_run)
 
     with caplog.at_level(logging.INFO):
         try: asyncio.run(main.run())
@@ -449,3 +455,205 @@ def test_event_loop_lag_warns_only_above_threshold(caplog):
         assert "Event loop wake lag" not in caplog.text
         main.warn_event_loop_lag(expected=10, actual=11.1, threshold=1)
     assert "Event loop wake lag 1.100s" in caplog.text
+
+
+def test_blocked_discovery_does_not_delay_known_start_boundary(monkeypatch):
+    import asyncio
+    from collector import main
+
+    clock = [datetime(2026, 8, 4, 1, 0, tzinfo=timezone.utc)]
+    start = clock[0] + timedelta(seconds=40)
+    market = {"market_id": "future", "question": "future", "start_time": start,
+              "end_time": start + timedelta(minutes=5)}
+    discovery_started = asyncio.Event()
+    release_discovery = asyncio.Event()
+    started = []
+    discoveries = 0
+
+    class Connection:
+        def close(self): pass
+
+    async def idle(): await asyncio.Event().wait()
+    def collect(_con, selected, _stop):
+        started.append((selected["market_id"], clock[0]))
+        return idle()
+    async def discover():
+        nonlocal discoveries
+        discoveries += 1
+        if discoveries == 1: return [market]
+        discovery_started.set()
+        await release_discovery.wait()
+        return [market]
+    async def controlled_wait(_stop, _bitcoin, discovery_task, timeout):
+        await asyncio.sleep(0)
+        if discovery_task is not None and discovery_started.is_set():
+            clock[0] = start
+        elif timeout is not None and timeout >= 29:
+            clock[0] += timedelta(seconds=30)
+
+    monkeypatch.setattr(main, "connect_db", Connection)
+    monkeypatch.setattr(main, "repair_interval_starts", lambda _con: 0)
+    monkeypatch.setattr(main, "collect_binance", lambda *_args: idle())
+    monkeypatch.setattr(main, "collect_polymarket", collect)
+    monkeypatch.setattr(main, "discover_markets", discover)
+    monkeypatch.setattr(main, "upsert_market", lambda *_args: None)
+    monkeypatch.setattr(main, "publish_dashboard_snapshot", lambda _con: None)
+    monkeypatch.setattr(main, "utcnow", lambda: clock[0])
+    monkeypatch.setattr(main, "wait_for_lifecycle_wakeup", controlled_wait)
+
+    async def exercise():
+        task = asyncio.create_task(main.run())
+        await discovery_started.wait()
+        clock[0] = start
+        for _ in range(3): await asyncio.sleep(0)
+        try:
+            assert started == [("future", start)]
+        finally:
+            release_discovery.set()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(exercise())
+
+
+def test_blocked_discovery_does_not_delay_known_end_boundary(monkeypatch):
+    import asyncio
+    from collector import main
+
+    clock = [datetime(2026, 8, 4, 1, 0, tzinfo=timezone.utc)]
+    end = clock[0] + timedelta(seconds=40)
+    market = {"market_id": "active", "question": "active", "start_time": clock[0],
+              "end_time": end}
+    discovery_started = asyncio.Event()
+    release_discovery = asyncio.Event()
+    cancelled = set()
+    discoveries = 0
+
+    class Connection:
+        def close(self): pass
+
+    async def idle(): await asyncio.Event().wait()
+    async def collect(_con, selected, _stop):
+        try: await asyncio.Event().wait()
+        finally: cancelled.add(selected["market_id"])
+    async def discover():
+        nonlocal discoveries
+        discoveries += 1
+        if discoveries == 1: return [market]
+        discovery_started.set()
+        await release_discovery.wait()
+        return [market]
+    async def controlled_wakeup(_stop, _bitcoin, discovery_task, timeout):
+        await asyncio.sleep(0)
+        if discovery_task is not None and discovery_started.is_set():
+            clock[0] = end
+        elif timeout is not None and timeout >= 29:
+            clock[0] += timedelta(seconds=30)
+
+    monkeypatch.setattr(main, "connect_db", Connection)
+    monkeypatch.setattr(main, "repair_interval_starts", lambda _con: 0)
+    monkeypatch.setattr(main, "collect_binance", lambda *_args: idle())
+    monkeypatch.setattr(main, "collect_polymarket", collect)
+    monkeypatch.setattr(main, "discover_markets", discover)
+    monkeypatch.setattr(main, "upsert_market", lambda *_args: None)
+    monkeypatch.setattr(main, "publish_dashboard_snapshot", lambda _con: None)
+    monkeypatch.setattr(main, "utcnow", lambda: clock[0])
+    monkeypatch.setattr(main, "wait_for_lifecycle_wakeup", controlled_wakeup)
+
+    async def exercise():
+        task = asyncio.create_task(main.run())
+        await discovery_started.wait()
+        for _ in range(5): await asyncio.sleep(0)
+        try:
+            assert "active" in cancelled
+        finally:
+            release_discovery.set()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(exercise())
+
+
+def test_failed_discovery_preserves_known_markets(caplog):
+    import asyncio
+    import logging
+    from collector import main
+
+    known = [{"market_id": "known"}]
+
+    async def exercise():
+        async def fail(): raise ConnectionError("gamma failed")
+        task = asyncio.create_task(fail())
+        await asyncio.sleep(0)
+        retained, updated = main.apply_discovery_result(None, task, known)
+        assert retained is known
+        assert updated is False
+
+    with caplog.at_level(logging.ERROR):
+        asyncio.run(exercise())
+    assert "Market discovery failed" in caplog.text
+    assert "gamma failed" in caplog.text
+
+
+def test_successful_discovery_replaces_known_markets(monkeypatch):
+    import asyncio
+    from collector import main
+
+    known = [{"market_id": "old"}]
+    found = [{"market_id": "new"}]
+    inserted = []
+    monkeypatch.setattr(main, "upsert_market", lambda _con, market: inserted.append(market["market_id"]))
+
+    async def exercise():
+        async def succeed(): return found
+        task = asyncio.create_task(succeed())
+        await asyncio.sleep(0)
+        updated_markets, updated = main.apply_discovery_result(None, task, known)
+        assert updated_markets is found
+        assert updated is True
+
+    asyncio.run(exercise())
+    assert inserted == ["new"]
+
+
+def test_only_one_discovery_task_exists_at_a_time(monkeypatch):
+    import asyncio
+    from collector import main
+
+    started = 0
+    async def blocked():
+        nonlocal started
+        started += 1
+        await asyncio.Event().wait()
+    monkeypatch.setattr(main, "discover_markets", blocked)
+
+    async def exercise():
+        now = datetime.now(timezone.utc)
+        first = main.start_discovery_if_due(None, None, now)
+        second = main.start_discovery_if_due(first, None, now)
+        await asyncio.sleep(0)
+        assert second is first
+        await main.cancel_discovery_task(first)
+
+    asyncio.run(exercise())
+    assert started == 1
+
+
+def test_shutdown_cancels_inflight_discovery_cleanly(monkeypatch):
+    import asyncio
+    from collector import main
+
+    finalized = asyncio.Event()
+    async def blocked():
+        try: await asyncio.Event().wait()
+        finally: finalized.set()
+    monkeypatch.setattr(main, "discover_markets", blocked)
+
+    async def exercise():
+        task = main.start_discovery_if_due(None, None, datetime.now(timezone.utc))
+        await asyncio.sleep(0)
+        await main.cancel_discovery_task(task)
+        assert task.cancelled()
+        assert finalized.is_set()
+
+    asyncio.run(exercise())
