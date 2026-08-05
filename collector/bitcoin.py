@@ -9,7 +9,7 @@ from typing import Awaitable, Callable
 import duckdb
 import websockets
 
-from .markets import bump_status, is_query_interrupted, utcnow
+from .markets import DATABASE_WRITE_LOCK, bump_status, is_query_interrupted, utcnow
 
 URL = "wss://stream.binance.com:9443/stream?streams=btcusdt@aggTrade/btcusdt@bookTicker"
 
@@ -45,30 +45,56 @@ def insert_event(con: duckdb.DuckDBPyConnection, event: dict) -> bool:
     return before == 0
 
 
+def persist_event(con: duckdb.DuckDBPyConnection, event: dict) -> None:
+    with DATABASE_WRITE_LOCK:
+        fresh = insert_event(con, event)
+        bump_status(con, "binance", events=int(fresh), duplicates=int(not fresh),
+                    message_time=event["exchange_timestamp"])
+
+
+def bump_status_safely(con, *args, **kwargs) -> None:
+    with DATABASE_WRITE_LOCK:
+        bump_status(con, *args, **kwargs)
+
+
+async def run_database_call(function, *args, **kwargs):
+    task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await task
+        raise
+
+
 async def collect_binance(con: duckdb.DuckDBPyConnection, stop: asyncio.Event, *,
                           connector: Callable[..., Awaitable] = websockets.connect, base_delay: float = 1) -> None:
     delay = base_delay
-    while not stop.is_set():
-        try:
-            async with connector(URL, ping_interval=20, ping_timeout=20) as ws:
-                delay = base_delay
-                async for raw in ws:
-                    if stop.is_set(): return
-                    try:
-                        event = parse_binance(raw)
-                        fresh = insert_event(con, event)
-                        bump_status(con, "binance", events=int(fresh), duplicates=int(not fresh), message_time=event["exchange_timestamp"])
-                    except Exception as exc:
-                        if stop.is_set() or is_query_interrupted(exc):
-                            return
-                        logging.exception("Malformed Binance message")
-                        bump_status(con, "binance", malformed=1, error=str(exc))
-        except asyncio.CancelledError: raise
-        except Exception as exc:
-            if stop.is_set() or is_query_interrupted(exc):
-                return
-            logging.warning("Binance websocket disconnected; reconnecting in %.1fs: %s", delay, exc)
-            bump_status(con, "binance", reconnects=1, error=str(exc))
-            try: await asyncio.wait_for(stop.wait(), timeout=delay)
-            except (TimeoutError, asyncio.TimeoutError): pass
-            delay = min(delay * 2, 30)
+    writer_con = con.cursor()
+    try:
+        while not stop.is_set():
+            try:
+                async with connector(URL, ping_interval=20, ping_timeout=20) as ws:
+                    delay = base_delay
+                    async for raw in ws:
+                        if stop.is_set(): return
+                        try:
+                            event = parse_binance(raw)
+                            await run_database_call(persist_event, writer_con, event)
+                        except Exception as exc:
+                            if stop.is_set() or is_query_interrupted(exc):
+                                return
+                            logging.exception("Malformed Binance message")
+                            await run_database_call(
+                                bump_status_safely, writer_con, "binance", malformed=1, error=str(exc))
+            except asyncio.CancelledError: raise
+            except Exception as exc:
+                if stop.is_set() or is_query_interrupted(exc):
+                    return
+                logging.warning("Binance websocket disconnected; reconnecting in %.1fs: %s", delay, exc)
+                await run_database_call(
+                    bump_status_safely, writer_con, "binance", reconnects=1, error=str(exc))
+                try: await asyncio.wait_for(stop.wait(), timeout=delay)
+                except (TimeoutError, asyncio.TimeoutError): pass
+                delay = min(delay * 2, 30)
+    finally:
+        writer_con.close()

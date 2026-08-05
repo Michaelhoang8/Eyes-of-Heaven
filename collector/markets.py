@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,6 +17,7 @@ DEFAULT_DB = ROOT / "data" / "research.duckdb"
 DASHBOARD_SNAPSHOT = ROOT / "data" / "dashboard_snapshot"
 GAMMA_URL = "https://gamma-api.polymarket.com/markets"
 GAMMA_EVENT_SLUG_URL = "https://gamma-api.polymarket.com/events/slug/{slug}"
+DATABASE_WRITE_LOCK = threading.Lock()
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS markets (

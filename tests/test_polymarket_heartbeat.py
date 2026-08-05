@@ -72,7 +72,9 @@ def test_pong_is_control_traffic_and_market_json_still_inserts(tmp_path):
 def test_reconnect_and_shutdown_do_not_leak_heartbeat_tasks(monkeypatch, tmp_path):
     entered_second_connection = asyncio.Event()
     created = finalized = active = 0
+    readers_created = readers_finalized = writers_created = writers_finalized = 0
     connections = 0
+    original_reader = polymarket.read_messages
 
     async def tracked_heartbeat(_websocket, interval=10):
         nonlocal created, finalized, active
@@ -83,6 +85,18 @@ def test_reconnect_and_shutdown_do_not_leak_heartbeat_tasks(monkeypatch, tmp_pat
         finally:
             active -= 1
             finalized += 1
+
+    async def tracked_reader(*args, **kwargs):
+        nonlocal readers_created, readers_finalized
+        readers_created += 1
+        try: return await original_reader(*args, **kwargs)
+        finally: readers_finalized += 1
+
+    async def tracked_writer(*_args, **_kwargs):
+        nonlocal writers_created, writers_finalized
+        writers_created += 1
+        try: await asyncio.Event().wait()
+        finally: writers_finalized += 1
 
     class WebSocket:
         def __init__(self, number): self.number = number
@@ -106,6 +120,8 @@ def test_reconnect_and_shutdown_do_not_leak_heartbeat_tasks(monkeypatch, tmp_pat
         return Connection(connections)
 
     monkeypatch.setattr(polymarket, "application_heartbeat", tracked_heartbeat)
+    monkeypatch.setattr(polymarket, "read_messages", tracked_reader)
+    monkeypatch.setattr(polymarket, "write_messages", tracked_writer)
     con = connect_db(tmp_path / "test.duckdb")
 
     async def exercise():
@@ -118,4 +134,6 @@ def test_reconnect_and_shutdown_do_not_leak_heartbeat_tasks(monkeypatch, tmp_pat
     asyncio.run(exercise())
     assert connections == 2
     assert created == finalized == 2
+    assert readers_created == readers_finalized == 2
+    assert writers_created == writers_finalized == 1
     assert active == 0
