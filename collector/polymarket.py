@@ -74,15 +74,21 @@ def _float(value):
 def insert_events(con, quotes, trades) -> tuple[int, int]:
     inserted = duplicates = 0
     for table, rows in (("polymarket_quotes", quotes), ("polymarket_trades", trades)):
-        for row in rows:
-            exists = con.execute(f"SELECT count(*) FROM {table} WHERE event_id=?", [row["event_id"]]).fetchone()[0]
-            columns = ("event_id", "source_timestamp", "receipt_timestamp", "market_id", "token_id", "outcome",
-                       "event_type", "best_bid", "best_ask", "bid_size", "ask_size") if table == "polymarket_quotes" else (
-                       "event_id", "source_timestamp", "receipt_timestamp", "market_id", "token_id", "outcome",
-                       "event_type", "price", "size")
-            marks = ",".join("?" for _ in columns)
-            con.execute(f"INSERT OR IGNORE INTO {table} VALUES ({marks})", [row[k] for k in columns])
-            inserted += int(not exists); duplicates += int(bool(exists))
+        if not rows:
+            continue
+        columns = ("event_id", "source_timestamp", "receipt_timestamp", "market_id", "token_id", "outcome",
+                   "event_type", "best_bid", "best_ask", "bid_size", "ask_size") if table == "polymarket_quotes" else (
+                   "event_id", "source_timestamp", "receipt_timestamp", "market_id", "token_id", "outcome",
+                   "event_type", "price", "size")
+        row_marks = f"({','.join('?' for _ in columns)})"
+        values = ",".join(row_marks for _ in rows)
+        parameters = [row[column] for row in rows for column in columns]
+        added = len(con.execute(
+            f"INSERT INTO {table} VALUES {values} ON CONFLICT DO NOTHING RETURNING event_id",
+            parameters,
+        ).fetchall())
+        inserted += added
+        duplicates += len(rows) - added
     return inserted, duplicates
 
 
