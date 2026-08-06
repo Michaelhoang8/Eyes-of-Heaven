@@ -54,15 +54,18 @@ DuckDB is stored at `data/research.duckdb` and is created automatically. Tables 
 
 - `markets`: discovery metadata, explicit Up/Down token mapping, status, and resolution
 - `bitcoin_events`: Binance trades and best bid/ask observations
-- `polymarket_quotes`: Polymarket top-of-book observations
+- `polymarket_top_of_book`: compact top-of-book seeds, changes, and once-per-second state confirmations
+- `polymarket_quotes`: preserved legacy raw quote history (new collection does not append to it)
 - `polymarket_trades`: Polymarket trade messages
 - `collector_status`: last-message times, reconnects, totals, malformed messages, duplicates, and last errors
 
 Raw observations are append-only apart from exact duplicate IDs, which are ignored and counted. Missing values remain null. All timestamps are stored as UTC `TIMESTAMPTZ` values.
 
+The compact representation is an additive migration: collector startup creates the new table and a compatibility view named `polymarket_quote_points`. Existing `polymarket_quotes` rows are never rewritten or deleted. The view retains legacy observations before each token's first compact state, then uses compact observations; markets with no compact data continue to use all preserved legacy rows.
+
 ## Checkpoint behavior
 
-Each checkpoint selects the latest valid observation at or before the checkpoint. It never looks forward and never interpolates. A Polymarket quote more than 15 seconds old at the checkpoint is considered insufficiently close and returns null. Midpoints require both bid and ask.
+Each checkpoint selects the latest valid state confirmation at or before the checkpoint. It never looks forward and never interpolates. A Polymarket state confirmation more than five seconds old at the checkpoint is considered insufficiently close and returns null. Midpoints require both bid and ask. `last_changed_at` remains available separately from `state_as_of`, so an unchanged but recently confirmed quote is fresh without losing when its price actually changed.
 
 ## Test
 

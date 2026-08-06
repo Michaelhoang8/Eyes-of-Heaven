@@ -43,6 +43,12 @@ CREATE TABLE IF NOT EXISTS polymarket_trades (
   token_id VARCHAR NOT NULL, outcome VARCHAR NOT NULL, event_type VARCHAR NOT NULL,
   price DOUBLE NOT NULL, size DOUBLE
 );
+CREATE TABLE IF NOT EXISTS polymarket_top_of_book (
+  event_id VARCHAR PRIMARY KEY, market_id VARCHAR NOT NULL,
+  token_id VARCHAR NOT NULL, outcome VARCHAR NOT NULL, event_type VARCHAR NOT NULL,
+  best_bid DOUBLE, best_ask DOUBLE, last_changed_at TIMESTAMPTZ NOT NULL,
+  state_as_of TIMESTAMPTZ NOT NULL
+);
 CREATE TABLE IF NOT EXISTS collector_status (
   source VARCHAR PRIMARY KEY, last_message_timestamp TIMESTAMPTZ,
   reconnect_count BIGINT NOT NULL DEFAULT 0, total_events BIGINT NOT NULL DEFAULT 0,
@@ -52,6 +58,23 @@ CREATE TABLE IF NOT EXISTS collector_status (
 CREATE INDEX IF NOT EXISTS btc_time_idx ON bitcoin_events(exchange_timestamp);
 CREATE INDEX IF NOT EXISTS quote_market_time_idx ON polymarket_quotes(market_id, source_timestamp);
 CREATE INDEX IF NOT EXISTS trade_market_time_idx ON polymarket_trades(market_id, source_timestamp);
+CREATE INDEX IF NOT EXISTS top_market_time_idx ON polymarket_top_of_book(market_id, state_as_of);
+"""
+
+TOP_OF_BOOK_VIEW_SQL = """
+CREATE OR REPLACE VIEW polymarket_quote_points AS
+SELECT event_id,last_changed_at source_timestamp,state_as_of receipt_timestamp,
+       market_id,token_id,outcome,event_type,best_bid,best_ask,
+       NULL::DOUBLE bid_size,NULL::DOUBLE ask_size,last_changed_at,state_as_of
+FROM polymarket_top_of_book
+UNION ALL
+SELECT q.*,COALESCE(q.source_timestamp,q.receipt_timestamp) last_changed_at,
+       COALESCE(q.source_timestamp,q.receipt_timestamp) state_as_of
+FROM polymarket_quotes q
+WHERE COALESCE(q.source_timestamp,q.receipt_timestamp) < COALESCE(
+  (SELECT min(top.state_as_of) FROM polymarket_top_of_book top
+   WHERE top.market_id=q.market_id AND top.token_id=q.token_id),
+  TIMESTAMPTZ 'infinity')
 """
 
 
@@ -91,6 +114,7 @@ def connect_db(path: str | Path = DEFAULT_DB) -> duckdb.DuckDBPyConnection:
     path.parent.mkdir(parents=True, exist_ok=True)
     con = duckdb.connect(str(path))
     con.execute(SCHEMA)
+    con.execute(TOP_OF_BOOK_VIEW_SQL)
     return con
 
 
@@ -231,7 +255,8 @@ def publish_dashboard_snapshot(con: duckdb.DuckDBPyConnection,
     """Publish atomic Parquet snapshots without sharing the live DuckDB file."""
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
-    tables = ("markets", "bitcoin_events", "polymarket_quotes", "polymarket_trades", "collector_status")
+    tables = ("markets", "bitcoin_events", "polymarket_quotes", "polymarket_trades",
+              "polymarket_top_of_book", "collector_status")
     for table in tables:
         target = directory / f"{table}.parquet"
         temporary = directory / f".{table}.{os.getpid()}.tmp.parquet"

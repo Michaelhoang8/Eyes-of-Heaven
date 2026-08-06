@@ -17,11 +17,11 @@ Finding = tuple[str, str, str, str, str, str]
 
 def determine_verdict(*, failures: list[Finding], suspicious: list[Finding],
                       official_available: bool, polymarket_event_count: int,
-                      token_sanity: str) -> str:
+                      token_sanity: str, research_eligible: bool = True) -> str:
     if failures:
         return "FAIL"
     if (suspicious or not official_available or polymarket_event_count == 0
-            or token_sanity != "PASS"):
+            or token_sanity != "PASS" or not research_eligible):
         return "SUSPICIOUS"
     return "PASS"
 
@@ -79,6 +79,49 @@ def nearest(con, sql: str, params: list[Any]):
     return con.execute(sql, params).fetchone()
 
 
+def research_exclusion_reasons(*, market: dict[str, Any], start: datetime, end: datetime,
+                               btc: pd.DataFrame, checkpoint_results: dict,
+                               max_checkpoint_age: float, max_btc_boundary_age: float = 5,
+                               max_btc_gap: float = 30) -> list[str]:
+    reasons = []
+    if market.get("status") != "completed":
+        reasons.append("market is not marked completed")
+    if market.get("resolved_outcome") not in ("Up", "Down"):
+        reasons.append("market has no resolved Up/Down outcome")
+    up, down = market.get("up_token_id"), market.get("down_token_id")
+    if not up or not down or up == down:
+        reasons.append("invalid Up/Down token mapping")
+
+    if btc.empty:
+        reasons.append("inadequate BTC observation coverage: no observations")
+    else:
+        timestamps = [utc(value) for value in btc.exchange_timestamp]
+        start_age = (timestamps[0] - start).total_seconds()
+        end_age = (end - timestamps[-1]).total_seconds()
+        if start_age > max_btc_boundary_age:
+            reasons.append(f"inadequate BTC start coverage: first observation is {start_age:.3f}s after start")
+        if end_age > max_btc_boundary_age:
+            reasons.append(f"inadequate BTC end coverage: last observation is {end_age:.3f}s before end")
+        if len(timestamps) < 2:
+            reasons.append("inadequate BTC observation coverage: fewer than 2 observations")
+        else:
+            largest_gap = max((right-left).total_seconds() for left, right in zip(timestamps, timestamps[1:]))
+            if largest_gap > max_btc_gap:
+                reasons.append(f"inadequate BTC observation coverage: maximum gap is {largest_gap:.3f}s")
+            if btc.btc_value.nunique(dropna=True) < 2:
+                reasons.append(f"inadequate BTC observation coverage: all {len(btc)} observations have the same price")
+
+    for seconds in (60, 30, 20, 10, 5, 3, 2, 1):
+        values = checkpoint_results.get(seconds, (None, {}))[1]
+        for outcome in ("Up", "Down"):
+            quote, age, _midpoint = values.get(outcome, (None, None, None))
+            if quote is None or age is None:
+                reasons.append(f"Polymarket T-{seconds} {outcome} observation missing")
+            elif age > max_checkpoint_age:
+                reasons.append(f"Polymarket T-{seconds} {outcome} observation stale: {age:.3f}s")
+    return reasons
+
+
 def audit(market_id: str | None, latest: bool, max_age: float, database: str | None = None) -> int:
     con = open_connection(database) if database else open_connection()
     if latest:
@@ -120,13 +163,13 @@ def audit(market_id: str | None, latest: bool, max_age: float, database: str | N
         failures.append(("HIGH","token mapping","Up and Down token IDs are identical","invalid metadata","collector/markets.py map_outcome_tokens","Reject identical token IDs"))
 
     qstats = con.execute("""SELECT count(*) total,
-      min(COALESCE(source_timestamp,receipt_timestamp)) first_source,
-      max(COALESCE(source_timestamp,receipt_timestamp)) last_source,
+      min(state_as_of) first_source,
+      max(state_as_of) last_source,
       min(receipt_timestamp) first_receipt,max(receipt_timestamp) last_receipt,
       count(*) FILTER (WHERE outcome='Up') up_count,count(*) FILTER (WHERE outcome='Down') down_count,
-      count(*) FILTER (WHERE COALESCE(source_timestamp,receipt_timestamp)< ?) before_count,
-      count(*) FILTER (WHERE COALESCE(source_timestamp,receipt_timestamp)> ?) after_count
-      FROM polymarket_quotes WHERE market_id=?""",[start,end,market_id]).fetchone()
+      count(*) FILTER (WHERE state_as_of< ?) before_count,
+      count(*) FILTER (WHERE state_as_of> ?) after_count
+      FROM polymarket_quote_points WHERE market_id=?""",[start,end,market_id]).fetchone()
     tstats = con.execute("""SELECT count(*),
       count(*) FILTER (WHERE COALESCE(source_timestamp,receipt_timestamp)< ?),
       count(*) FILTER (WHERE COALESCE(source_timestamp,receipt_timestamp)> ?)
@@ -144,9 +187,9 @@ def audit(market_id: str | None, latest: bool, max_age: float, database: str | N
     outside = qstats[7]+qstats[8]+tstats[1]+tstats[2]
     if outside:
         print("Outside-window samples:")
-        samples=con.execute("""SELECT event_id,outcome,event_type,COALESCE(source_timestamp,receipt_timestamp) ts
-          FROM polymarket_quotes WHERE market_id=? AND (COALESCE(source_timestamp,receipt_timestamp)<? OR COALESCE(source_timestamp,receipt_timestamp)>?)
-          ORDER BY ts LIMIT 5""",[market_id,start,end]).fetchall()
+        samples=con.execute("""SELECT event_id,outcome,event_type,state_as_of ts
+          FROM polymarket_quote_points WHERE market_id=? AND (state_as_of<? OR state_as_of>?)
+          ORDER BY state_as_of,receipt_timestamp,event_id LIMIT 5""",[market_id,start,end]).fetchall()
         for sample in samples: print("  "+" | ".join(fmt(x) for x in sample))
         failures.append(("HIGH","Polymarket ingestion window",f"{outside} raw events assigned after/before the market interval",
           "collector switched subscriptions only on its periodic discovery timer","collector/main.py run",
@@ -204,9 +247,9 @@ def audit(market_id: str | None, latest: bool, max_age: float, database: str | N
     token_sanity="INSUFFICIENT DATA"
     last_prices={}
     for outcome,token in (("Up",market.get("up_token_id")),("Down",market.get("down_token_id"))):
-        rows=con.execute("""SELECT (best_bid+best_ask)/2 midpoint FROM polymarket_quotes
+        rows=con.execute("""SELECT (best_bid+best_ask)/2 midpoint FROM polymarket_quote_points
           WHERE market_id=? AND token_id=? AND best_bid IS NOT NULL AND best_ask IS NOT NULL
-          AND COALESCE(source_timestamp,receipt_timestamp) BETWEEN ? AND ? ORDER BY COALESCE(source_timestamp,receipt_timestamp)""",[market_id,token,start,end]).fetchall()
+          AND state_as_of BETWEEN ? AND ? ORDER BY state_as_of,receipt_timestamp,event_id""",[market_id,token,start,end]).fetchall()
         first,last=(rows[0][0],rows[-1][0]) if rows else (None,None); last_prices[outcome]=last
         print(f"{outcome}: token ID={token}; stored outcome label={outcome}; first observed price={fmt(first)}; last observed price={fmt(last)}")
     winner=market.get("resolved_outcome"); loser="Down" if winner=="Up" else "Up"
@@ -232,9 +275,10 @@ def audit(market_id: str | None, latest: bool, max_age: float, database: str | N
           AND {price_expr} IS NOT NULL ORDER BY exchange_timestamp DESC LIMIT 1""",[start,target])
         values={}
         for outcome in ("Up","Down"):
-            q=nearest(con,"""SELECT COALESCE(source_timestamp,receipt_timestamp),best_bid,best_ask
-              FROM polymarket_quotes WHERE market_id=? AND outcome=? AND COALESCE(source_timestamp,receipt_timestamp) BETWEEN ? AND ?
-              AND best_bid IS NOT NULL AND best_ask IS NOT NULL ORDER BY COALESCE(source_timestamp,receipt_timestamp) DESC LIMIT 1""",[market_id,outcome,start,target])
+            q=nearest(con,"""SELECT state_as_of,best_bid,best_ask
+              FROM polymarket_quote_points WHERE market_id=? AND outcome=? AND state_as_of BETWEEN ? AND ?
+              AND best_bid IS NOT NULL AND best_ask IS NOT NULL
+              ORDER BY state_as_of DESC,last_changed_at DESC,receipt_timestamp DESC,event_id DESC LIMIT 1""",[market_id,outcome,start,target])
             age=(target-utc(q[0])).total_seconds() if q else None
             mid=(q[1]+q[2])/2 if q and age<=max_age else None
             values[outcome]=(q,age,mid)
@@ -243,6 +287,18 @@ def audit(market_id: str | None, latest: bool, max_age: float, database: str | N
         print(f"{seconds}s | checkpoint={fmt(target)} | BTC ts={fmt(b[0] if b else None)} price={fmt(b[1] if b else None)} age={fmt(bage)}s | "
           f"Up ts={fmt(values['Up'][0][0] if values['Up'][0] else None)} bid={fmt(values['Up'][0][1] if values['Up'][0] else None)} ask={fmt(values['Up'][0][2] if values['Up'][0] else None)} midpoint={fmt(values['Up'][2])} age={fmt(values['Up'][1])}s | "
           f"Down ts={fmt(values['Down'][0][0] if values['Down'][0] else None)} bid={fmt(values['Down'][0][1] if values['Down'][0] else None)} ask={fmt(values['Down'][0][2] if values['Down'][0] else None)} midpoint={fmt(values['Down'][2])} age={fmt(values['Down'][1])}s")
+
+    exclusion_reasons = research_exclusion_reasons(
+        market=market, start=start, end=end, btc=btc, checkpoint_results=checkpoint_results,
+        max_checkpoint_age=max_age)
+    research_eligible = not exclusion_reasons
+    print(f"\nRESEARCH ELIGIBLE: {'YES' if research_eligible else 'NO'}")
+    print("EXCLUSION REASONS:")
+    if exclusion_reasons:
+        for reason in exclusion_reasons:
+            print(f"* {reason}")
+    else:
+        print("None")
 
     print("\nTIMESTAMP CONSISTENCY")
     print("market discovery: ISO 8601 strings -> DuckDB timezone-aware TIMESTAMPTZ")
@@ -279,7 +335,7 @@ def audit(market_id: str | None, latest: bool, max_age: float, database: str | N
         suspicious.append(("MEDIUM","resolution comparison",f"Binance change {change:.4f} disagrees with official winner {market['resolved_outcome']}","Polymarket settles on Chainlink, not Binance","collector/audit_market.py","Do not infer settlement from Binance"))
     status=determine_verdict(failures=failures, suspicious=suspicious,
       official_available=official is not None, polymarket_event_count=in_window_polymarket_events,
-      token_sanity=token_sanity)
+      token_sanity=token_sanity, research_eligible=research_eligible)
     print(f"\nOVERALL STATUS: {status}")
     print("\nFINDINGS")
     findings=failures+suspicious

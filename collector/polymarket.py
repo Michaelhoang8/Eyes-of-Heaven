@@ -54,7 +54,7 @@ def parse_polymarket(payload: str, market: dict, receipt=None) -> tuple[list[dic
             token = str(item.get("asset_id", msg.get("asset_id", "")))
             if token not in token_outcome: continue
             source = _ts(msg.get("timestamp"), receipt)
-            if kind in {"book", "best_bid_ask", "price_change"}:
+            if kind in {"book", "best_bid_ask"}:
                 bids = msg.get("bids", []) if kind == "book" else []
                 asks = msg.get("asks", []) if kind == "book" else []
                 best_bid = max((float(x["price"]) for x in bids), default=None) if bids else _float(item.get("best_bid"))
@@ -99,15 +99,72 @@ def insert_events(con, quotes, trades) -> tuple[int, int]:
     return inserted, duplicates
 
 
-def persist_messages(con, market: dict, messages: list[tuple[str, datetime]]) -> None:
-    quotes, trades = [], []
+def insert_top_states(con, rows) -> tuple[int, int]:
+    if not rows:
+        return 0, 0
+    columns = ("event_id", "market_id", "token_id", "outcome", "event_type",
+               "best_bid", "best_ask", "last_changed_at", "state_as_of")
+    frame = pd.DataFrame.from_records(rows, columns=columns)
+    con.register("_top_of_book_batch", frame)
+    try:
+        added = len(con.execute("""
+            INSERT INTO polymarket_top_of_book SELECT * FROM _top_of_book_batch
+            ON CONFLICT DO NOTHING RETURNING event_id
+        """).fetchall())
+    finally:
+        con.unregister("_top_of_book_batch")
+    return added, len(rows) - added
+
+
+def _book_top(msg: dict) -> tuple[float | None, float | None]:
+    bids, asks = msg.get("bids", []), msg.get("asks", [])
+    return (max((float(row["price"]) for row in bids), default=None),
+            min((float(row["price"]) for row in asks), default=None))
+
+
+def persist_compact_messages(con, market: dict, messages, state: dict) -> None:
+    token_outcome = {market["up_token_id"]: "Up", market["down_token_id"]: "Down"}
+    top_rows, trades = [], []
     malformed = 0
     last_error = None
-    for payload, receipt in messages:
+    for payload, receipt, generation in messages:
         try:
-            message_quotes, message_trades = parse_polymarket(payload, market, receipt)
-            quotes.extend(message_quotes)
-            trades.extend(message_trades)
+            if state.get("_generation") != generation:
+                state.clear()
+                state["_generation"] = generation
+            parsed = json.loads(payload)
+            for msg in parsed if isinstance(parsed, list) else [parsed]:
+                kind = msg.get("event_type")
+                token = str(msg.get("asset_id", ""))
+                if token not in token_outcome:
+                    continue
+                source = _ts(msg.get("timestamp"), receipt)
+                if kind == "book" and token not in state:
+                    best_bid, best_ask = _book_top(msg)
+                    current = {"best_bid": best_bid, "best_ask": best_ask,
+                               "last_changed_at": source, "state_as_of": receipt,
+                               "last_snapshot_second": None}
+                    state[token] = current
+                    top_rows.append({"event_id": _id(msg, token, "book_seed"),
+                        "market_id": market["market_id"], "token_id": token,
+                        "outcome": token_outcome[token], "event_type": "book_seed", **current})
+                    top_rows[-1].pop("last_snapshot_second")
+                elif kind == "best_bid_ask" and token in state:
+                    current = state[token]
+                    current.update(best_bid=_float(msg.get("best_bid")),
+                                   best_ask=_float(msg.get("best_ask")),
+                                   last_changed_at=source, state_as_of=receipt)
+                    top_rows.append({"event_id": _id(msg, token),
+                        "market_id": market["market_id"], "token_id": token,
+                        "outcome": token_outcome[token], "event_type": "best_bid_ask",
+                        "best_bid": current["best_bid"], "best_ask": current["best_ask"],
+                        "last_changed_at": source, "state_as_of": receipt})
+                elif kind == "last_trade_price":
+                    trades.append({"event_id": _id(msg, token), "source_timestamp": source,
+                        "receipt_timestamp": receipt, "market_id": market["market_id"],
+                        "token_id": token, "outcome": token_outcome[token], "event_type": "trade",
+                        "price": float(msg["price"]), "size": _float(msg.get("size"))})
+                # price_change and recurring book messages are intentionally not persisted.
         except Exception as exc:
             if is_query_interrupted(exc):
                 raise
@@ -115,10 +172,33 @@ def persist_messages(con, market: dict, messages: list[tuple[str, datetime]]) ->
             last_error = str(exc)
             logging.exception("Malformed Polymarket message")
     with DATABASE_WRITE_LOCK:
-        added, dup = insert_events(con, quotes, trades)
-        message_time = max((receipt for _, receipt in messages), default=None) if added else None
-        bump_status(con, "polymarket", events=added, duplicates=dup, malformed=malformed,
-                    error=last_error, message_time=message_time)
+        added, dup = insert_top_states(con, top_rows)
+        trade_added, trade_dup = insert_events(con, [], trades)
+        bump_status(con, "polymarket", events=added + trade_added,
+                    duplicates=dup + trade_dup, malformed=malformed, error=last_error,
+                    message_time=max((receipt for _, receipt, _ in messages), default=None))
+
+
+def persist_state_snapshots(con, market: dict, state: dict, as_of: datetime) -> None:
+    second = as_of.replace(microsecond=0)
+    rows = []
+    outcomes = {market["up_token_id"]: "Up", market["down_token_id"]: "Down"}
+    for token, current in list(state.items()):
+        if token.startswith("_") or current["last_snapshot_second"] == second:
+            continue
+        current["last_snapshot_second"] = second
+        current["state_as_of"] = as_of
+        event_id = hashlib.sha256(
+            f"{market['market_id']}:{token}:snapshot:{second.isoformat()}".encode()).hexdigest()
+        rows.append({"event_id": event_id, "market_id": market["market_id"],
+            "token_id": token, "outcome": outcomes[token], "event_type": "snapshot",
+            "best_bid": current["best_bid"], "best_ask": current["best_ask"],
+            "last_changed_at": current["last_changed_at"], "state_as_of": as_of})
+    if rows:
+        with DATABASE_WRITE_LOCK:
+            added, dup = insert_top_states(con, rows)
+            bump_status(con, "polymarket", events=added, duplicates=dup,
+                        message_time=as_of if added else None)
 
 
 def bump_status_safely(con, *args, **kwargs) -> None:
@@ -128,7 +208,7 @@ def bump_status_safely(con, *args, **kwargs) -> None:
 
 async def read_messages(websocket, queue: asyncio.Queue, market_id: str, stop: asyncio.Event,
                         *, receipt_clock=utcnow, queue_warning_depth=QUEUE_WARNING_DEPTH,
-                        queue_stats: dict | None = None) -> int:
+                        queue_stats: dict | None = None, subscription_generation: int = 0) -> int:
     """Drain the socket promptly; database persistence is owned by the writer task."""
     maximum_depth = queue.qsize()
     warned = maximum_depth >= queue_warning_depth
@@ -140,7 +220,7 @@ async def read_messages(websocket, queue: asyncio.Queue, market_id: str, stop: a
         if raw == "PONG":
             continue
         try:
-            queue.put_nowait((raw, receipt))
+            queue.put_nowait((raw, receipt, subscription_generation))
         except asyncio.QueueFull:
             if not saturated:
                 logging.error(
@@ -148,7 +228,7 @@ async def read_messages(websocket, queue: asyncio.Queue, market_id: str, stop: a
                     market_id, queue.maxsize,
                 )
                 saturated = True
-            await queue.put((raw, receipt))
+            await queue.put((raw, receipt, subscription_generation))
         depth = queue.qsize()
         maximum_depth = max(maximum_depth, depth)
         if queue_stats is not None:
@@ -165,15 +245,20 @@ async def read_messages(websocket, queue: asyncio.Queue, market_id: str, stop: a
 
 async def write_messages(con, market: dict, queue: asyncio.Queue) -> None:
     """Persist queued frames in order without blocking the asyncio event loop."""
+    state = {}
     while True:
-        messages = [await queue.get()]
+        try:
+            messages = [await asyncio.wait_for(queue.get(), timeout=.25)]
+        except asyncio.TimeoutError:
+            await asyncio.to_thread(persist_state_snapshots, con, market, state, utcnow())
+            continue
         while len(messages) < WRITE_BATCH_SIZE:
             try:
                 messages.append(queue.get_nowait())
             except asyncio.QueueEmpty:
                 break
         persistence = asyncio.create_task(asyncio.to_thread(
-            persist_messages, con, market, messages))
+            persist_compact_messages, con, market, messages, state))
         try:
             await asyncio.shield(persistence)
         except asyncio.CancelledError:
@@ -190,6 +275,12 @@ async def write_messages(con, market: dict, queue: asyncio.Queue) -> None:
         finally:
             for _ in messages:
                 queue.task_done()
+        # While draining a backlog, never claim that an older queued state was
+        # current at wall-clock writer time. The newest reader receipt in this
+        # batch is the latest defensible state confirmation.
+        await asyncio.to_thread(
+            persist_state_snapshots, con, market, state,
+            max(receipt for _, receipt, _ in messages))
 
 
 async def collect_polymarket(con: duckdb.DuckDBPyConnection, market: dict, stop: asyncio.Event, *,
@@ -198,6 +289,7 @@ async def collect_polymarket(con: duckdb.DuckDBPyConnection, market: dict, stop:
     delay = base_delay
     queue = asyncio.Queue(maxsize=queue_maxsize)
     queue_stats = {"maximum_depth": 0}
+    subscription_generation = 0
     writer_con = con.cursor()
     writer_task = asyncio.create_task(write_messages(writer_con, market, queue))
     try:
@@ -206,12 +298,14 @@ async def collect_polymarket(con: duckdb.DuckDBPyConnection, market: dict, stop:
                 # Polymarket requires text PING/PONG heartbeats. Disable the websockets
                 # control-frame heartbeat so only the protocol-required mechanism runs.
                 async with connector(URL, ping_interval=None) as ws:
+                    subscription_generation += 1
                     await ws.send(json.dumps({"assets_ids": [market["up_token_id"], market["down_token_id"]],
                                               "type": "market", "custom_feature_enabled": True}))
                     delay = base_delay
                     heartbeat_task = asyncio.create_task(application_heartbeat(ws))
                     reader_task = asyncio.create_task(read_messages(
-                        ws, queue, market["market_id"], stop, queue_stats=queue_stats))
+                        ws, queue, market["market_id"], stop, queue_stats=queue_stats,
+                        subscription_generation=subscription_generation))
                     try:
                         done, _ = await asyncio.wait(
                             (reader_task, writer_task), return_when=asyncio.FIRST_COMPLETED)

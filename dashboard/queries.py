@@ -5,7 +5,7 @@ from pathlib import Path
 import duckdb
 import pandas as pd
 
-from collector.markets import DASHBOARD_SNAPSHOT, DEFAULT_DB
+from collector.markets import DASHBOARD_SNAPSHOT, DEFAULT_DB, TOP_OF_BOOK_VIEW_SQL
 
 CHECKPOINTS = (60, 30, 10, 5, 1)
 MAX_CHECKPOINT_AGE_SECONDS = 5
@@ -22,13 +22,15 @@ def open_connection(path: str | Path = DEFAULT_DB, read_only: bool = True):
         return duckdb.connect(str(path), read_only=read_only)
     except duckdb.IOException:
         snapshot = Path(path).parent / DASHBOARD_SNAPSHOT.name
-        tables = ("markets", "bitcoin_events", "polymarket_quotes", "polymarket_trades", "collector_status")
+        tables = ("markets", "bitcoin_events", "polymarket_quotes", "polymarket_trades",
+                  "polymarket_top_of_book", "collector_status")
         if not all((snapshot / f"{table}.parquet").exists() for table in tables):
             raise
         con = duckdb.connect(":memory:")
         for table in tables:
             filename = str(snapshot / f"{table}.parquet").replace("'", "''")
             con.execute(f"CREATE TABLE {table} AS SELECT * FROM read_parquet('{filename}')")
+        con.execute(TOP_OF_BOOK_VIEW_SQL)
         return con
 
 
@@ -40,7 +42,7 @@ def _checkpoint_sql(seconds: int, outcome: str) -> str:
                    THEN (q.best_bid + q.best_ask) / 2 END
          FROM quote_points q WHERE q.market_id=m.market_id AND q.outcome='{outcome}'
           AND q.ts <= m.end_time - INTERVAL '{seconds} seconds'
-         ORDER BY q.ts DESC LIMIT 1) AS {label}_{seconds}s"""
+         ORDER BY q.ts DESC,q.last_changed_at DESC,q.receipt_timestamp DESC,q.event_id DESC LIMIT 1) AS {label}_{seconds}s"""
 
 
 def completed_market_summary(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
@@ -50,8 +52,9 @@ def completed_market_summary(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
       SELECT exchange_timestamp ts, COALESCE(price, (best_bid+best_ask)/2) price
       FROM bitcoin_events WHERE price IS NOT NULL OR (best_bid IS NOT NULL AND best_ask IS NOT NULL)
     ), quote_points AS (
-      SELECT market_id, outcome, COALESCE(source_timestamp, receipt_timestamp) ts, best_bid, best_ask
-      FROM polymarket_quotes
+      SELECT market_id,outcome,state_as_of ts,best_bid,best_ask,event_id,
+             receipt_timestamp,last_changed_at
+      FROM polymarket_quote_points
     )
     SELECT m.market_id, m.start_time, m.end_time, m.resolved_outcome winner,
       (SELECT price FROM btc_points b WHERE b.ts >= m.start_time AND b.ts <= m.end_time ORDER BY b.ts LIMIT 1) btc_open,
@@ -59,7 +62,7 @@ def completed_market_summary(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
       (SELECT max(price) FROM btc_points b WHERE b.ts BETWEEN m.start_time AND m.end_time) btc_high,
       (SELECT min(price) FROM btc_points b WHERE b.ts BETWEEN m.start_time AND m.end_time) btc_low,
       (SELECT count(*) FROM bitcoin_events b WHERE b.exchange_timestamp BETWEEN m.start_time AND m.end_time) binance_count,
-      ((SELECT count(*) FROM polymarket_quotes q WHERE q.market_id=m.market_id AND COALESCE(q.source_timestamp,q.receipt_timestamp) BETWEEN m.start_time AND m.end_time) +
+      ((SELECT count(*) FROM polymarket_quote_points q WHERE q.market_id=m.market_id AND q.state_as_of BETWEEN m.start_time AND m.end_time) +
        (SELECT count(*) FROM polymarket_trades t WHERE t.market_id=m.market_id AND COALESCE(t.source_timestamp,t.receipt_timestamp) BETWEEN m.start_time AND m.end_time)) polymarket_count,
       (SELECT max(gap) FROM (SELECT epoch(ts-lag(ts) OVER (ORDER BY ts)) gap FROM btc_points b
                              WHERE b.ts BETWEEN m.start_time AND m.end_time)) max_binance_gap_seconds,
@@ -85,10 +88,11 @@ def market_series(con, market_id: str) -> tuple[pd.DataFrame, pd.DataFrame]:
         AND (price IS NOT NULL OR (best_bid IS NOT NULL AND best_ask IS NOT NULL)) ORDER BY event_time
     """, [market_id]).df()
     poly = con.execute("""
-      SELECT COALESCE(source_timestamp,receipt_timestamp) AS event_time, outcome,
+      SELECT state_as_of AS event_time,outcome,
              CASE WHEN best_bid IS NOT NULL AND best_ask IS NOT NULL THEN (best_bid+best_ask)/2 END AS midpoint
-      FROM polymarket_quotes q, markets m WHERE q.market_id=? AND m.market_id=q.market_id
-        AND COALESCE(q.source_timestamp,q.receipt_timestamp) BETWEEN m.start_time AND m.end_time ORDER BY event_time
+      FROM polymarket_quote_points q,markets m WHERE q.market_id=? AND m.market_id=q.market_id
+        AND q.state_as_of BETWEEN m.start_time AND m.end_time
+        ORDER BY event_time,q.last_changed_at,q.receipt_timestamp,q.event_id
     """, [market_id]).df()
     return btc, poly
 
@@ -104,9 +108,10 @@ def checkpoint_table(con, market_id: str, seconds=(60, 30, 20, 10, 5, 3, 2, 1)) 
         btc = con.execute("SELECT price FROM bitcoin_events WHERE exchange_timestamp<=? AND exchange_timestamp>=? AND price IS NOT NULL ORDER BY exchange_timestamp DESC LIMIT 1", [target, start]).fetchone()
         values = {}
         for outcome in ("Up", "Down"):
-            quote = con.execute("""SELECT (best_bid+best_ask)/2, epoch(?-COALESCE(source_timestamp,receipt_timestamp))
-              FROM polymarket_quotes WHERE market_id=? AND outcome=? AND COALESCE(source_timestamp,receipt_timestamp)<=?
-              AND best_bid IS NOT NULL AND best_ask IS NOT NULL ORDER BY COALESCE(source_timestamp,receipt_timestamp) DESC LIMIT 1""",
+            quote = con.execute("""SELECT (best_bid+best_ask)/2,epoch(?-state_as_of)
+              FROM polymarket_quote_points WHERE market_id=? AND outcome=? AND state_as_of<=?
+              AND best_bid IS NOT NULL AND best_ask IS NOT NULL
+              ORDER BY state_as_of DESC,last_changed_at DESC,receipt_timestamp DESC,event_id DESC LIMIT 1""",
               [target, market_id, outcome, target]).fetchone()
             values[outcome] = quote[0] if quote and quote[1] <= MAX_CHECKPOINT_AGE_SECONDS else None
         price = btc[0] if btc else None; open_price = opening[0] if opening else None

@@ -35,13 +35,17 @@ def test_application_heartbeat_sends_ping_on_cadence(monkeypatch):
 def test_pong_is_control_traffic_and_market_json_still_inserts(tmp_path):
     stop = asyncio.Event()
     connection_options = {}
+    book = json.dumps({"event_type": "book", "asset_id": "up",
+                       "bids": [{"price": "0.3", "size": "1"}],
+                       "asks": [{"price": "0.7", "size": "1"}],
+                       "timestamp": "1785822900000"})
     payload = json.dumps({"event_type": "best_bid_ask", "asset_id": "up",
                           "best_bid": "0.4", "best_ask": "0.6",
                           "timestamp": "1785822901000"})
 
     class WebSocket:
         def __init__(self):
-            self.messages = iter(["PONG", payload])
+            self.messages = iter(["PONG", book, payload])
             self.sent = []
         async def send(self, value): self.sent.append(value)
         def __aiter__(self): return self
@@ -65,7 +69,7 @@ def test_pong_is_control_traffic_and_market_json_still_inserts(tmp_path):
     asyncio.run(polymarket.collect_polymarket(con, MARKET, stop, connector=connector))
 
     assert connection_options["ping_interval"] is None
-    assert con.execute("SELECT count(*) FROM polymarket_quotes").fetchone()[0] == 1
+    assert con.execute("SELECT count(*) FROM polymarket_top_of_book").fetchone()[0] >= 2
     assert con.execute("SELECT malformed_messages FROM collector_status WHERE source='polymarket'").fetchone()[0] == 0
 
 

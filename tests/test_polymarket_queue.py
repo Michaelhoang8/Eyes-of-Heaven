@@ -31,17 +31,18 @@ def test_slow_writer_does_not_prevent_reader_accepting_messages(monkeypatch):
     release = threading.Event()
     persisted = []
 
-    def slow_persist(_con, _market, messages):
+    def slow_persist(_con, _market, messages, _state):
         entered.set()
         release.wait(timeout=2)
-        persisted.extend(raw for raw, _receipt in messages)
+        persisted.extend(raw for raw, _receipt, _generation in messages)
 
-    monkeypatch.setattr(polymarket, "persist_messages", slow_persist)
+    monkeypatch.setattr(polymarket, "persist_compact_messages", slow_persist)
+    monkeypatch.setattr(polymarket, "persist_state_snapshots", lambda *_args: None)
 
     async def exercise():
         queue = asyncio.Queue(maxsize=10)
         writer = asyncio.create_task(polymarket.write_messages(None, MARKET, queue))
-        await queue.put((payload(0), BASE))
+        await queue.put((payload(0), BASE, 0))
         await asyncio.to_thread(entered.wait, 1)
         reader = asyncio.create_task(polymarket.read_messages(
             Messages([payload(1), payload(2), payload(3)]), queue, "market", asyncio.Event()))
@@ -56,7 +57,7 @@ def test_slow_writer_does_not_prevent_reader_accepting_messages(monkeypatch):
     asyncio.run(exercise())
 
 
-def test_receipt_timestamp_is_captured_by_reader_and_order_is_preserved(tmp_path):
+def test_receipt_timestamp_is_captured_by_reader_and_order_is_preserved():
     receipts = iter(BASE + timedelta(milliseconds=i) for i in range(3))
 
     async def exercise():
@@ -68,17 +69,7 @@ def test_receipt_timestamp_is_captured_by_reader_and_order_is_preserved(tmp_path
         queue.task_done(); queue.task_done()
         assert [item[0] for item in items] == [payload(0), payload(1)]
         assert [item[1] for item in items] == [BASE, BASE + timedelta(milliseconds=2)]
-
-        con = connect_db(tmp_path / "ordered.duckdb")
-        writer = asyncio.create_task(polymarket.write_messages(con.cursor(), MARKET, queue))
-        for item in items: await queue.put(item)
-        await queue.join()
-        writer.cancel()
-        await asyncio.gather(writer, return_exceptions=True)
-        rows = con.execute("SELECT event_id,receipt_timestamp FROM polymarket_quotes ORDER BY receipt_timestamp").fetchall()
-        expected = [polymarket.parse_polymarket(payload(i), MARKET, items[i][1])[0][0]
-                    for i in range(2)]
-        assert rows == [(row["event_id"], row["receipt_timestamp"]) for row in expected]
+        assert [item[2] for item in items] == [0, 0]
 
     asyncio.run(exercise())
 
@@ -87,7 +78,7 @@ def test_queue_saturation_is_logged_and_does_not_drop(caplog):
     async def exercise():
         queue = asyncio.Queue(maxsize=1)
         stats = {"maximum_depth": 0}
-        await queue.put(("existing", BASE))
+        await queue.put(("existing", BASE, 0))
         reader = asyncio.create_task(polymarket.read_messages(
             Messages(["next"]), queue, "market", asyncio.Event(), receipt_clock=lambda: BASE,
             queue_warning_depth=1, queue_stats=stats))
@@ -112,12 +103,13 @@ def test_shutdown_drains_queued_messages(monkeypatch, caplog, tmp_path):
 
     persisted = []
 
-    def blocked_persist(_con, _market, messages):
+    def blocked_persist(_con, _market, messages, _state):
         write_started.set()
         release.wait(timeout=2)
-        persisted.extend(raw for raw, _receipt in messages)
+        persisted.extend(raw for raw, _receipt, _generation in messages)
 
-    monkeypatch.setattr(polymarket, "persist_messages", blocked_persist)
+    monkeypatch.setattr(polymarket, "persist_compact_messages", blocked_persist)
+    monkeypatch.setattr(polymarket, "persist_state_snapshots", lambda *_args: None)
 
     class WebSocket(Messages):
         def __init__(self): super().__init__([payload(0), payload(1), payload(2)])
