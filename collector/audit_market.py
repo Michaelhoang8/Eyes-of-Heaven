@@ -13,6 +13,8 @@ from dashboard.queries import completed_market_summary, market_series, open_conn
 
 GAMMA_EVENT_URL = "https://gamma-api.polymarket.com/events/slug/{slug}"
 Finding = tuple[str, str, str, str, str, str]
+MAX_BTC_BOUNDARY_AGE_SECONDS = 5
+MAX_BTC_GAP_SECONDS = 30
 
 
 def determine_verdict(*, failures: list[Finding], suspicious: list[Finding],
@@ -81,8 +83,9 @@ def nearest(con, sql: str, params: list[Any]):
 
 def research_exclusion_reasons(*, market: dict[str, Any], start: datetime, end: datetime,
                                btc: pd.DataFrame, checkpoint_results: dict,
-                               max_checkpoint_age: float, max_btc_boundary_age: float = 5,
-                               max_btc_gap: float = 30) -> list[str]:
+                               max_checkpoint_age: float,
+                               max_btc_boundary_age: float = MAX_BTC_BOUNDARY_AGE_SECONDS,
+                               max_btc_gap: float = MAX_BTC_GAP_SECONDS) -> list[str]:
     reasons = []
     if market.get("status") != "completed":
         reasons.append("market is not marked completed")

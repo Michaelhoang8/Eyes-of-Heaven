@@ -89,6 +89,15 @@ python -m collector.audit_market --market-id MARKET_ID
 
 Checkpoint quotes older than five seconds are reported as stale and returned as null.
 
+## Evaluate a collector cohort
+
+The cohort-quality command reads DuckDB without changing it, reports aligned 5m/15m interval coverage and separate Polymarket/BTC eligibility, and can optionally export its per-market rows:
+
+```text
+python -m collector.cohort_quality --since 2026-08-06T12:02:10.894Z
+python -m collector.cohort_quality --since 2026-08-06T12:02:10.894Z --csv cohort-quality.csv
+```
+
 ## Data sources and limitations
 
 - Binance public Spot WebSocket: `BTCUSDT` aggregate trades and book ticker
