@@ -105,6 +105,13 @@ python -m collector.backfill_resolutions --since 2026-08-06T12:02:10.894Z --dry-
 python -m collector.backfill_resolutions --since 2026-08-06T12:02:10.894Z
 ```
 
+Run the descriptive, Polymarket-only calibration report for eligible markets and optionally export the exact market/checkpoint inputs:
+
+```text
+python -m collector.calibration --since 2026-08-06T12:02:10.894Z
+python -m collector.calibration --since 2026-08-06T12:02:10.894Z --csv calibration-rows.csv
+```
+
 ## Data sources and limitations
 
 - Binance public Spot WebSocket: `BTCUSDT` aggregate trades and book ticker
