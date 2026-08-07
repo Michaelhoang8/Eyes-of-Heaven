@@ -54,8 +54,10 @@ def test_missing_market_detection_reports_no_row(tmp_path):
     add_healthy_data(con, first)
     add_healthy_data(con, last)
     _quality, summary, missing = evaluate_cohort(con, BASE - timedelta(seconds=1))
-    assert {key: summary[5][key] for key in ("expected", "stored", "missing")} == {
-        "expected": 3, "stored": 2, "missing": 1}
+    assert {key: summary[5][key] for key in (
+        "expected", "stored", "completed_resolved", "no_row", "quality_eligible")} == {
+        "expected": 3, "stored": 2, "completed_resolved": 2,
+        "no_row": 1, "quality_eligible": 2}
     assert [(row["start_time"], row["database_state"]) for row in missing] == [
         (BASE + timedelta(minutes=5), "no market row at all")]
 
@@ -66,7 +68,7 @@ def test_unresolved_completed_market_classification(tmp_path):
     add_healthy_data(con, market)
     quality = market_quality(con, market)
     state = classify_expected_start([market], {"unresolved": quality})
-    assert state == "completed market but missing resolution"
+    assert state == "active/unresolved"
     assert not quality["polymarket_calibration_eligible"]
 
 

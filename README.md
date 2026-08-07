@@ -98,6 +98,13 @@ python -m collector.cohort_quality --since 2026-08-06T12:02:10.894Z
 python -m collector.cohort_quality --since 2026-08-06T12:02:10.894Z --csv cohort-quality.csv
 ```
 
+Ended markets whose official outcome was not captured during live discovery can be checked and backfilled from exact Gamma metadata. Preview first; the update changes only market resolution status and leaves every observation table untouched:
+
+```text
+python -m collector.backfill_resolutions --since 2026-08-06T12:02:10.894Z --dry-run
+python -m collector.backfill_resolutions --since 2026-08-06T12:02:10.894Z
+```
+
 ## Data sources and limitations
 
 - Binance public Spot WebSocket: `BTCUSDT` aggregate trades and book ticker

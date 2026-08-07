@@ -143,30 +143,13 @@ def _market_rows(con: duckdb.DuckDBPyConnection, since: datetime) -> list[dict[s
 def classify_expected_start(candidates: list[dict[str, Any]], quality_by_id: dict[str, dict]) -> str:
     if not candidates:
         return "no market row at all"
-    completed = [row for row in candidates if row.get("status") == "completed"]
-    if not completed:
-        statuses = ", ".join(sorted({str(row.get("status")) for row in candidates}))
-        return f"market row but status not completed ({statuses})"
-    qualities = [quality_by_id[str(row["market_id"])] for row in completed]
-    if any(item["fully_eligible"] for item in qualities):
-        return "eligible"
-    reasons = []
-    for quality in qualities:
-        reasons.extend(quality["exclusion_reasons"])
-    unique = list(dict.fromkeys(reasons))
-    if any(reason == "missing resolution" for reason in unique):
-        return "completed market but missing resolution"
-    btc = [reason for reason in unique if reason in {
-        "no BTC observations", "BTC start coverage", "BTC end coverage",
-        "fewer than 2 BTC observations", "BTC gap", "constant BTC price"}]
-    poly = [reason for reason in unique if "Polymarket" in reason]
-    if btc and poly:
-        return "completed market but incomplete BTC and Polymarket coverage"
-    if btc:
-        return "completed market but incomplete BTC coverage"
-    if poly:
-        return "completed market but incomplete Polymarket checkpoint coverage"
-    return "; ".join(unique) if unique else "another identifiable state unavailable"
+    if any(row.get("status") == "completed"
+           and row.get("resolved_outcome") in ("Up", "Down") for row in candidates):
+        return "completed/resolved"
+    if any(row.get("status") == "active" or row.get("resolved_outcome") not in ("Up", "Down")
+           for row in candidates):
+        return "active/unresolved"
+    return "other status"
 
 
 def evaluate_cohort(con: duckdb.DuckDBPyConnection, since: datetime):
@@ -182,17 +165,26 @@ def evaluate_cohort(con: duckdb.DuckDBPyConnection, since: datetime):
                                     max(utc(row["start_time"]) for row in completed_type), minutes)
                     if completed_type else [])
         rows_type = [row for row in all_rows if interval_minutes(row) == minutes]
-        eligible_starts = 0
+        coverage_counts = Counter()
+        quality_eligible_starts = 0
         for start in expected:
             candidates = [row for row in rows_type if utc(row["start_time"]) == start]
             state = classify_expected_start(candidates, quality_by_id)
-            if state == "eligible":
-                eligible_starts += 1
-            else:
+            coverage_counts[state] += 1
+            completed_ids = [str(row["market_id"]) for row in candidates
+                             if str(row["market_id"]) in quality_by_id]
+            if any(quality_by_id[market_id]["fully_eligible"] for market_id in completed_ids):
+                quality_eligible_starts += 1
+            if state != "completed/resolved":
                 missing.append({"interval_minutes": minutes, "start_time": start,
                                 "database_state": state})
-        interval_summary[minutes] = {"expected": len(expected), "stored": len(completed_type),
-                                     "missing": len(expected) - eligible_starts,
+        interval_summary[minutes] = {"expected": len(expected),
+                                     "stored": len(expected) - coverage_counts["no market row at all"],
+                                     "completed_resolved": coverage_counts["completed/resolved"],
+                                     "active_unresolved": coverage_counts["active/unresolved"],
+                                     "other_status": coverage_counts["other status"],
+                                     "no_row": coverage_counts["no market row at all"],
+                                     "quality_eligible": quality_eligible_starts,
                                      "first": expected[0] if expected else None,
                                      "last": expected[-1] if expected else None}
     return quality, interval_summary, missing
@@ -215,8 +207,12 @@ def print_report(since: datetime, quality: list[dict[str, Any]], interval_summar
         print(f"Expected intervals: {summary['expected']}")
         if summary["first"]:
             print(f"Expected range: {_display(summary['first'])} through {_display(summary['last'])}")
-        print(f"Stored: {summary['stored']}")
-        print(f"Missing: {summary['missing']}")
+        print(f"Stored market rows: {summary['stored']}")
+        print(f"Completed/resolved: {summary['completed_resolved']}")
+        print(f"Active/unresolved: {summary['active_unresolved']}")
+        print(f"Other status: {summary['other_status']}")
+        print(f"No market row: {summary['no_row']}")
+        print(f"Quality eligible: {summary['quality_eligible']}")
     total = len(quality)
     poly = sum(row["polymarket_calibration_eligible"] for row in quality)
     btc = sum(row["btc_feature_eligible"] for row in quality)
@@ -260,7 +256,7 @@ def print_report(since: datetime, quality: list[dict[str, Any]], interval_summar
                   " | ".join(checkpoints) +
                   f" | {row['polymarket_calibration_eligible']} | "
                   f"{row['btc_feature_eligible']} | {row['fully_eligible']}")
-    print("\nMissing expected intervals:")
+    print("\nExpected intervals without a completed resolution:")
     if not missing:
         print("None")
     else:
