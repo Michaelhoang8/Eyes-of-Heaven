@@ -1,0 +1,49 @@
+POLYMARKET MICROSTRUCTURE DEVELOPMENT PROTOCOL
+Created before inspecting microstructure/outcome relationships.
+
+DATASET
+- Existing post-2026-08-08T04:39:14.888Z cohort is reused as a DEVELOPMENT cohort for this NEW hypothesis.
+- It is NOT considered out-of-sample validation for microstructure.
+- Analyze 5-minute markets only.
+- Use only rows where microstructure_eligible=true.
+- No future quote state may be used.
+
+PRIMARY HYPOTHESIS
+Checkpoint: T-60.
+Feature: momentum_30s = p_up(T-60) - p_up(T-90).
+Question: Does recent Polymarket probability movement contain information about the eventual outcome beyond the current T-60 p_up?
+
+Primary model comparison:
+Baseline: outcome ~ logit(current p_up)
+Expanded: outcome ~ logit(current p_up) + momentum_30s
+
+SECONDARY HYPOTHESIS
+Checkpoint: T-30.
+Feature: momentum_30s = p_up(T-30) - p_up(T-60).
+Use the same baseline and expanded model comparison.
+
+PRE-SPECIFIED REPORTING
+For T-60 and T-30 separately:
+- N
+- Up rate
+- mean/median current p_up
+- mean/median momentum_30s
+- baseline Brier score and log loss
+- expanded-model momentum coefficient
+- likelihood-ratio comparison
+- AIC difference
+- chronological first-half vs second-half direction/stability
+- no threshold search
+- no trading P&L claim
+
+SPREAD
+Current bid/ask spread may be summarized descriptively only.
+Do not search spread thresholds or present spread as a trading signal in this experiment.
+
+RULES
+- Do not change checkpoint definitions.
+- Do not change the 30-second lookback.
+- Do not add interactions, bins, BTC variables, volatility, order flow, or additional predictors.
+- Do not combine T-60 and T-30 as independent rows in one inferential test.
+- Any promising result must be frozen and tested on markets occurring AFTER this analysis.
+

@@ -1,0 +1,29 @@
+﻿VALIDATION COHORT START UTC
+2026-08-08T04:39:14.888Z
+
+Exploratory / development cohort:
+51 fully eligible 5m markets before the validation boundary.
+
+Validation cohort:
+Markets with start_time > 2026-08-08T04:39:14.888Z
+
+FROZEN HYPOTHESIS 1
+5m, T−60, uncertain Polymarket
+0.30 <= p_up <= 0.70
+Compare Polymarket direction (p_up >= .50) against Binance direction (btc_distance_bps >= 0)
+Existing exploratory result: BTC won 7/7, but N=7.
+
+FROZEN HYPOTHESIS 2
+5m, T−30, BTC slightly below open
+-5 <= btc_distance_bps < 0
+Test whether actual Up frequency is higher than Polymarket's predicted probability.
+Existing exploratory result: 5/12 Up versus ~1.57 expected.
+
+TARGET
+At least 300 new fully eligible 5m markets.
+
+RULES
+Do not combine development and validation cohorts.
+Do not change thresholds.
+Do not add checkpoints, indicators, or predictors.
+Do not perform threshold searches on the validation cohort.
